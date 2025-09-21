@@ -133,6 +133,8 @@
 
 ![Arduino_IDE_2](./img/Arduino_IDE_2.png "Arduino IDE安装BW16开发板示意图")
 
+- 请安装3.17版本！！！
+
 ![Arduino_IDE_3](./img/Arduino_IDE_3.png "Arduino IDE选择BW16开发板示意图")
 
 2.导入本地库
