@@ -127,6 +127,10 @@ void wifi_tx_auth_req(void* sta_mac, void* bssid);
 size_t wifi_build_assoc_req(void* sta_mac, void* bssid, const char* ssid, AssocReqFrame &out);
 void wifi_tx_assoc_req(void* sta_mac, void* bssid, const char* ssid);
 
+// 兼容：广播去认证/解除关联（轻量唤醒STA用于学习/触发重连）
+void wifi_tx_broadcast_deauth(void* bssid, uint16_t reason, int burstCount, int interDelayUs);
+void wifi_tx_broadcast_disassoc(void* bssid, uint16_t reason, int burstCount, int interDelayUs);
+
 
 
 #endif

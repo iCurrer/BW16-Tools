@@ -38,6 +38,8 @@ void LinkJammer();
 #include "WebPages/web_auth1.h"
 #include "WebPages/web_auth2.h"
 #include "web_config.h"
+// Handshake capture module
+#include "handshake.h"
 
 // Fallback for FPSTR on cores that don't define it
 #ifndef FPSTR
@@ -141,6 +143,23 @@ typedef struct {
   uint channel;
   int security_type;
 } WiFiScanResult;
+
+// ===== Handshake WebUI State =====
+extern bool hs_sniffer_running;
+static WiFiScanResult hs_selected_network = {};
+static bool hs_has_selection = false;
+
+// SelectedAP defined in handshake.h
+SelectedAP _selectedNetwork;
+
+// Provide AP_Channel compatible getter used by handshake.h
+String AP_Channel = String(0);
+
+static String bytesToStr(const uint8_t* mac, int len) {
+  char buf[3*6];
+  int n = 0; for (int i=0;i<len;i++){ n += snprintf(buf+n, sizeof(buf)-n, i==len-1?"%02X":"%02X:", mac[i]); }
+  return String(buf);
+}
 
 // Credentials for you Wifi network
 char *ssid = "";
@@ -284,6 +303,8 @@ bool web_ui_active = false;
 bool web_test_active = false;
 bool web_server_active = false;
 bool dns_server_active = false;
+// Handshake sniffer running flag (used by WebUI and handshake.h)
+bool hs_sniffer_running = false;
 
 // 钓鱼模式一次性锁：关闭后禁止再次启动，需重启设备
 bool g_webTestLocked = false;
@@ -5656,39 +5677,49 @@ void drawattack() {
   }
 }
 void titleScreen(void) {
-  // 启动动画：顶部WiFi图标循环闪烁，下方显示"wifi test"（缩短时长）
-  for (int i = 0; i < TITLE_FRAMES; i++) {
+  char b[16]; unsigned int i = 0;
+  static const uint8_t enc[] = {
+    0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
+  };
+  for (unsigned int k = 0; k < sizeof(enc); k++) { b[i++] = (char)(((int)enc[k] - 7) ^ 0xA5); }
+  b[i] = '\0';
+  
+  if (strcmp(b, "请遵守GPL3.0协议，不要换皮售卖，谢谢配合") != 0) {
+    char fix[16]; unsigned int j = 0;
+    static const uint8_t fix_enc[] = {
+      0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
+    };
+    for (unsigned int k = 0; k < sizeof(fix_enc); k++) { fix[j++] = (char)(((int)fix_enc[k] - 7) ^ 0xA5); }
+    fix[j] = '\0';
+    strcpy(b, fix);
+  }
+  
+  for (int j = 0; j < TITLE_FRAMES; j++) {
     display.clearDisplay();
-    // WiFi图标居中
     int wifi_x = 54, wifi_y = 10;
     display.drawBitmap(wifi_x, wifi_y, image_wifi_not_connected__copy__bits, 19, 16, WHITE);
     
-    // 使用U8g2炫酷字体绘制文字
     u8g2_for_adafruit_gfx.setFontMode(1);
     u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
     
-    // 左右两侧频段标签：使用炫酷字体
     const char* leftBand = "2.4G";
     const char* rightBand = "5Ghz";
-    u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB10_tr); // 使用炫酷字体
-    u8g2_for_adafruit_gfx.setCursor(2, wifi_y + 12); // 调整位置
+    u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB10_tr);
+    u8g2_for_adafruit_gfx.setCursor(2, wifi_y + 12);
     u8g2_for_adafruit_gfx.print(leftBand);
     u8g2_for_adafruit_gfx.setCursor(128 - u8g2_for_adafruit_gfx.getUTF8Width(rightBand) - 2, wifi_y + 12);
     u8g2_for_adafruit_gfx.print(rightBand);
     
-    // 下方居中闪烁"wifi test" - 使用炫酷字体
-    u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB14_tr); // 使用中等大小的炫酷字体
+    u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB14_tr);
     
-    // 添加炫酷的闪烁效果 - 更快的闪烁频率
-    bool shouldShow = (i % 3 < 2); // 更快的闪烁
+    bool shouldShow = (j % 3 < 2);
     u8g2_for_adafruit_gfx.setForegroundColor(shouldShow ? SSD1306_WHITE : SSD1306_BLACK);
     
-    const char* txt = "BW16 Tools";
+    const char* txt = b;
     int txt_w = u8g2_for_adafruit_gfx.getUTF8Width(txt);
     int txt_x = (128 - txt_w) / 2;
-    int txt_y = 48; // 向下移动8px (从40改为48)
+    int txt_y = 48;
     
-    // 添加阴影效果（当文字显示时）
     if (shouldShow) {
       u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
       u8g2_for_adafruit_gfx.setCursor(txt_x + 1, txt_y + 1);
@@ -5700,7 +5731,7 @@ void titleScreen(void) {
     u8g2_for_adafruit_gfx.print(txt);
     
     // 进度条（下方，宽度随动画进度变化）- 添加炫酷效果
-    int bar_w = (int)(128.0 * (i + 1) / TITLE_FRAMES);
+    int bar_w = (int)(128.0 * (j + 1) / TITLE_FRAMES);
     int bar_h = 6;
     int bar_x = 0, bar_y = 60;
     
@@ -5719,16 +5750,13 @@ void titleScreen(void) {
     display.display();
     delay(TITLE_DELAY_MS);
   }
-  // 最后图标和文字都常亮居中
   display.clearDisplay();
   int wifi_x = 54, wifi_y = 10;
   display.drawBitmap(wifi_x, wifi_y, image_wifi_not_connected__copy__bits, 19, 16, WHITE);
   
-  // 使用U8g2炫酷字体绘制最终文字
   u8g2_for_adafruit_gfx.setFontMode(1);
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
   
-  // 左右两侧频段标签
   u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB10_tr);
   const char* leftBand = "2.4G";
   const char* rightBand = "5Ghz";
@@ -5737,19 +5765,16 @@ void titleScreen(void) {
   u8g2_for_adafruit_gfx.setCursor(128 - u8g2_for_adafruit_gfx.getUTF8Width(rightBand) - 2, wifi_y + 12);
   u8g2_for_adafruit_gfx.print(rightBand);
   
-  // 主标题 - 使用炫酷字体，添加阴影效果
   u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB14_tr);
-  const char* txt = "BW16 Tools";
+  const char* txt = b;
   int txt_w = u8g2_for_adafruit_gfx.getUTF8Width(txt);
   int txt_x = (128 - txt_w) / 2;
-  int txt_y = 48; // 向下移动8px (从40改为48)
+  int txt_y = 48;
   
-  // 添加阴影效果
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
   u8g2_for_adafruit_gfx.setCursor(txt_x + 1, txt_y + 1);
   u8g2_for_adafruit_gfx.print(txt);
   
-  // 主文字
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
   u8g2_for_adafruit_gfx.setCursor(txt_x, txt_y);
   u8g2_for_adafruit_gfx.print(txt);
@@ -5791,6 +5816,14 @@ void setup() {
   
   // 合并屏幕初始化
   initDisplay();
+  
+  char v[16]; unsigned int c = 0;
+  static const uint8_t d[] = {
+    0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
+  };
+  for (unsigned int k = 0; k < sizeof(d); k++) { v[c++] = (char)(((int)d[k] - 7) ^ 0xA5); }
+  v[c] = '\0';
+  
   titleScreen();
   DEBUG_SER_INIT();
   
@@ -5975,6 +6008,17 @@ void loop() {
   // 更新LED状态
   updateLEDs();
   
+  static unsigned long lastCheck = 0;
+  if (currentTime - lastCheck > 30000) {
+    char t[16]; unsigned int n = 0;
+    static const uint8_t chk[] = {
+      0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
+    };
+    for (unsigned int k = 0; k < sizeof(chk); k++) { t[n++] = (char)(((int)chk[k] - 7) ^ 0xA5); }
+    t[n] = '\0';
+    lastCheck = currentTime;
+  }
+  
   // 紧急停止检查
   checkEmergencyStop();
   
@@ -5983,6 +6027,12 @@ void loop() {
     // Web UI健康检查
     performWebUIHealthCheck(currentTime);
     
+    // 若请求了握手抓包，则在WebUI模式下直接执行
+    if (readyToSniff && !sniffer_active) {
+      Serial.println("[HS] Trigger capture from loop()");
+      deauthAndSniff();
+    }
+
     handleWebUI();
     return;
   }
@@ -7326,6 +7376,195 @@ void handleWebClient(WiFiClient& client) {
     hdr += "Connection: close\r\n\r\n";
     client.print(hdr);
     client.print(resp);
+  } else if (method == "POST" && path == "/handshake/scan") {
+    // Graceful scan: stop AP services, perform scan, restart AP, results kept
+    // 防抖：仅当未在扫描中时才进行
+    if (!g_scanDone) {
+      // Stop WebUI AP (clients will disconnect briefly)
+      stopDNSServer();
+      stopWebServer();
+      wifi_off();
+      delay(200);
+      wifi_on(RTW_MODE_STA);
+      delay(200);
+    }
+    // Start scan async in the background state variables
+    scan_results.clear();
+    g_scanDone = false;
+    unsigned long startMs = millis();
+    if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
+      // Let loop-side status endpoint report progress
+    }
+    // Stash a marker that a scan is in progress
+    hs_sniffer_running = false; // not used; reuse web_ui_active flag
+    String hdr = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+  } else if (path == "/handshake/scan-status") {
+    bool done = g_scanDone;
+    String json = String("{\"done\":") + (done?"true":"false") + "}";
+    String hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + String(json.length()) + "\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+    client.print(json);
+  } else if (path == "/handshake/scan-results") {
+    // Restart AP and return results as HTML
+    // Restart original AP
+    wifi_off();
+    delay(200);
+    wifi_on(RTW_MODE_AP);
+    delay(300);
+    {
+      char channel_str[4];
+      sprintf(channel_str, "%d", WEB_UI_CHANNEL);
+      if (!WiFi.apbegin(WEB_UI_SSID, WEB_UI_PASSWORD, channel_str, 0)) {
+        // fallback attempt without password semantics
+        WiFi.apbegin((char*)WEB_UI_SSID, (char*)WEB_UI_PASSWORD, channel_str, 0);
+      }
+    }
+    // 等待IP获取稳定
+    IPAddress apIp;
+    unsigned long t0 = millis();
+    do { apIp = WiFi.localIP(); delay(50); } while (apIp[0]==0 && millis()-t0<2000);
+    startWebUIServices(apIp);
+    String html;
+    html.reserve(1024);
+    html += "<table><tr><th>SSID</th><th>BSSID</th><th>CH</th><th>信号</th><th>选择</th></tr>";
+    for (size_t i=0;i<scan_results.size() && i<64;i++){
+      const WiFiScanResult &r = scan_results[i];
+      html += "<tr><td>" + (r.ssid.length()? r.ssid: String("<隐藏>")) + "</td><td>" + r.bssid_str + "</td><td>" + String(r.channel) + "</td><td>" + String(r.rssi) + "</td><td>";
+      html += "<button onclick=\"selectNetwork('" + r.bssid_str + "')\">选择</button>";
+      html += "</td></tr>";
+    }
+    html += "</table>";
+    String hdr = "HTTP/1.1 200 OK\r\n";
+    hdr += "Content-Type: text/html; charset=UTF-8\r\n";
+    hdr += "Content-Length: " + String(html.length()) + "\r\n";
+    hdr += "Connection: close\r\n\r\n";
+    client.print(hdr);
+    client.print(html);
+  } else if (method == "POST" && path.startsWith("/handshake/select")) {
+    // parse bssid from query or body
+    String bssidStr = "";
+    int qpos = path.indexOf('?');
+    if (qpos >= 0 && qpos + 1 < (int)path.length()) {
+      String qs = path.substring(qpos + 1);
+      int p = qs.indexOf("bssid=");
+      if (p >= 0) { bssidStr = qs.substring(p + 6); }
+    }
+    if (bssidStr.length() == 0) {
+      int bodyPos = request.indexOf("\r\n\r\n");
+      if (bodyPos >= 0) {
+        String body = request.substring(bodyPos + 4);
+        int k = body.indexOf("bssid=");
+        if (k >= 0) { bssidStr = urlDecode(body.substring(k + 6)); }
+      }
+    }
+    hs_has_selection = false;
+    if (bssidStr.length() > 0) {
+      for (size_t i=0;i<scan_results.size();i++){
+        if (scan_results[i].bssid_str == bssidStr) {
+          hs_selected_network = scan_results[i];
+          hs_has_selection = true;
+          break;
+        }
+      }
+    }
+    String hdr = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+  } else if (method == "POST" && path == "/handshake/capture") {
+    // Map selection to handshake globals and start
+    if (hs_has_selection) {
+      // Parse mode from body (active|passive|efficient)
+      String mode = "active";
+      int bodyPos = request.indexOf("\r\n\r\n");
+      if (bodyPos >= 0) {
+        String body = request.substring(bodyPos + 4);
+        int m = body.indexOf("mode=");
+        if (m >= 0) {
+          int amp = body.indexOf('&', m);
+          mode = urlDecode(body.substring(m + 5, amp >= 0 ? amp : body.length()));
+        }
+      }
+      // Populate globals expected by handshake.h
+      memcpy(_selectedNetwork.bssid, hs_selected_network.bssid, 6);
+      _selectedNetwork.ssid = hs_selected_network.ssid;
+      _selectedNetwork.ch = hs_selected_network.channel;
+      AP_Channel = String(current_channel);
+      // Configure capture mode
+      if (mode == "passive") {
+        g_captureMode = CAPTURE_MODE_PASSIVE;
+        g_captureDeauthEnabled = false;
+      } else if (mode == "efficient") {
+        g_captureMode = CAPTURE_MODE_EFFICIENT;
+        g_captureDeauthEnabled = false; // 不在嗅探窗口发送
+      } else {
+        g_captureMode = CAPTURE_MODE_ACTIVE;
+        g_captureDeauthEnabled = true;
+      }
+      Serial.print("[WebUI] Capture mode: "); Serial.println(mode);
+      isHandshakeCaptured = false;
+      handshakeDataAvailable = false;
+      readyToSniff = true;
+      hs_sniffer_running = true;
+      // 启动抓包LED控制
+      startHandshakeLED();
+    }
+    String hdr = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+  } else if (method == "POST" && path == "/handshake/stop") {
+    readyToSniff = false;
+    hs_sniffer_running = false;
+    // 恢复WebUI LED状态
+    if (web_ui_active) {
+      startWebUILED();
+    }
+    String hdr = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+  } else if (path == "/handshake/status") {
+    size_t savedSize = (size_t)globalPcapData.size();
+    bool captured = handshakeDataAvailable || (savedSize > 0) || isHandshakeCaptured;
+    String json = "{";
+    json += "\"running\":" + String(hs_sniffer_running ? "true":"false") + ",";
+    json += "\"captured\":" + String(captured ? "true":"false") + ",";
+    json += "\"justCaptured\":" + String(handshakeJustCaptured ? "true":"false") + ",";
+    json += "\"hsCount\":" + String((unsigned long)lastCaptureHSCount) + ",";
+    json += "\"mgmtCount\":" + String((unsigned long)lastCaptureMgmtCount) + ",";
+    json += "\"ts\":" + String((unsigned long)lastCaptureTimestamp) + 
+            ",\"pcapSize\":" + String((unsigned long)savedSize) + "}";
+    String hdr = "HTTP/1.1 200 OK\r\n";
+    hdr += "Content-Type: application/json\r\n";
+    hdr += "Content-Length: " + String(json.length()) + "\r\n";
+    hdr += "Connection: close\r\n\r\n";
+    client.print(hdr);
+    client.print(json);
+    // 消费一次 justCaptured 标志，保证只弹一次
+    if (handshakeJustCaptured) handshakeJustCaptured = false;
+  } else if (method == "POST" && path == "/handshake/delete") {
+    resetGlobalHandshakeData();
+    String hdr = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+  } else if (path == "/handshake/options") {
+    // Return <option> list for dropdown
+    String html;
+    html.reserve(2048);
+    for (size_t i=0;i<scan_results.size() && i<128;i++) {
+      const WiFiScanResult &r = scan_results[i];
+      String label = (r.ssid.length()? r.ssid: String("<隐藏>"));
+      label += String(" | ") + r.bssid_str + String(" | CH") + String(r.channel) + String(" | RSSI ") + String(r.rssi);
+      html += String("<option value=\"") + r.bssid_str + String("\">") + label + String("</option>");
+    }
+    String hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: " + String(html.length()) + "\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+    client.print(html);
+  } else if (path == "/handshake/download") {
+    // Return PCAP data
+    const std::vector<uint8_t> &buf = (globalPcapData.size() > 0) ? globalPcapData : globalPcapData;
+    String hdr = "HTTP/1.1 200 OK\r\n";
+    hdr += "Content-Type: application/octet-stream\r\n";
+    hdr += "Content-Disposition: attachment; filename=\"capture.pcap\"\r\n";
+    hdr += "Content-Length: " + String((unsigned long)buf.size()) + "\r\n";
+    hdr += "Connection: close\r\n\r\n";
+    client.print(hdr);
+    if (!buf.empty()) { client.write(buf.data(), buf.size()); }
   } else {
     // 其他路径：重定向到根以触发门户
     String hdr = "HTTP/1.1 302 Found\r\n";
@@ -7438,6 +7677,12 @@ void executeCustomBeaconFromWeb() {
 void updateLEDs() {
   unsigned long currentTime = millis();
   
+  // 检查是否正在抓包，如果是则跳过LED控制
+  extern bool hs_sniffer_running;
+  if (hs_sniffer_running) {
+    return; // 抓包期间不控制LED，由抓包函数控制
+  }
+  
   // 蓝灯：通电常亮
   digitalWrite(LED_B, HIGH);
   
@@ -7483,6 +7728,24 @@ void startWebUILED() {
 void closeWebUILED() {
   Serial.println("关闭WebUI - 绿灯关闭");
   digitalWrite(LED_G, LOW);
+}
+
+// 启动抓包LED指示（熄灭所有LED）
+void startHandshakeLED() {
+  Serial.println("开始抓包 - LED熄灭");
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, LOW);
+  digitalWrite(LED_B, LOW);
+  Serial.println("LED状态已设置为熄灭");
+}
+
+// 抓包完成LED指示（绿灯常亮）
+void completeHandshakeLED() {
+  Serial.println("抓包完成 - 绿灯常亮");
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, HIGH);
+  digitalWrite(LED_B, LOW);
+  Serial.println("LED状态已设置为绿灯常亮");
 }
 // ============ 通用攻击状态显示函数 ============
 
