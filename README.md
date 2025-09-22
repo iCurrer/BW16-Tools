@@ -41,6 +41,7 @@
 ![UI](./img/ui.png "0.96 OLED UI")
 
 # 🔗 部分代码来源
+- 鸣谢：[@Ghost](https://github.com/Ghost64847) | [@浪木](https://github.com/shiyi226)
 - https://github.com/shiyi226/5gwifi-bw16
     - 2025-06-11
 - https://github.com/tesa-klebeband/RTL8720dn-WiFi-Packet-Injection
