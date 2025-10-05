@@ -8,8 +8,8 @@
 
 此项目中内存溢出与资源冲突似乎达成了一种微妙的平衡，以至于大部分功能一切正常，但存在潜在问题，这也是这些BUG难以修复的原因之一。
 
-***简单来说，如果你只需要用到WIFI相关功能，那么建议使用`main`分支的旧版本。
-如果愿意舍弃WIFI的抓包功能以使用蓝牙BLE相关功能，那么请使用`Beta`分支版本***
+***简单来说，如果你只需要用到WIFI相关功能，那么建议使用 [`main`](https://github.com/FlyingIceyyds/BW16-Tools/tree/main) 分支的旧版本。
+如果愿意舍弃WIFI的抓包功能以使用蓝牙BLE相关功能，那么请使用[`Beta`](https://github.com/FlyingIceyyds/BW16-Tools/tree/Beta)分支版本***
 
 ***如果你成功修复了这些问题，那么随时欢迎为此项目做出贡献***
 
