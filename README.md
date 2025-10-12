@@ -65,8 +65,8 @@ git clone -b Beta https://github.com/FlyingIceyyds/BW16-Tools/
     - 监听指定信道中的有效数据包数量
     - 生成实时图表统计
     - 右上角出现“[*]”指示，表示监听到了解除认证/关联帧
-- 快速抓捕 [Capture]
-    抓取WAP/WPA2握手包，与 Web UI 的 Handshake Capture 功能相同，但操作相对更方便
+- 快速抓包 [Capture]
+    - 抓取WAP/WPA2握手包，与 Web UI 的 Handshake Capture 功能相同，但操作相对更方便
 - Web UI
     - 自定义SSID信标帧攻击 [Custom Beacon]
     - WPA/WPA2握手包抓取 [Handshake Capture]
