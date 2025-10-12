@@ -151,6 +151,7 @@ void homeActionAttackDetect();
 void homeActionPacketMonitor();
 void homeActionDeepScan();
 void homeActionWebUI();
+void homeActionQuickCapture();
 
 // VARIABLES
 typedef struct {
@@ -321,6 +322,7 @@ static const HomeMenuItem g_homeMenuItems[] = {
   {"攻击帧检测[Detect]",     homeActionAttackDetect},
   {"监视器[Monitor]",        homeActionPacketMonitor},
   {"深度扫描 DeepScan",      homeActionDeepScan},
+  {"快速抓包[Capture]",      homeActionQuickCapture},
   {"启动[Web UI]",           homeActionWebUI}
 };
 static const int g_homeMenuCount = (int)(sizeof(g_homeMenuItems) / sizeof(g_homeMenuItems[0]));
@@ -339,6 +341,13 @@ bool web_server_active = false;
 bool dns_server_active = false;
 // Handshake sniffer running flag (used by WebUI and handshake.h)
 bool hs_sniffer_running = false;
+
+// 快速抓包相关变量
+bool quick_capture_active = false;
+bool quick_capture_completed = false;
+int quick_capture_mode = 0; // 0=主动, 1=被动, 2=高效
+unsigned long quick_capture_start_time = 0;
+unsigned long quick_capture_end_time = 0;
 
 // 钓鱼模式一次性锁：关闭后禁止再次启动，需重启设备
 bool g_webTestLocked = false;
@@ -6014,7 +6023,12 @@ void loop() {
     // 若请求了握手抓包，则在WebUI模式下直接执行
     if (readyToSniff && !sniffer_active) {
       Serial.println("[HS] Trigger capture from loop()");
-      deauthAndSniff();
+      deauthAndSniff(); // 初始化状态机
+    }
+    
+    // 持续更新非阻塞抓包状态机（WebUI模式）
+    if (sniffer_active) {
+      deauthAndSniff_update();
     }
 
     handleWebUI();
@@ -6025,6 +6039,148 @@ void loop() {
     performPhishingHealthCheck(currentTime);
     
     handleWebTest();
+    return;
+  }
+  
+  // 快速抓包模式检查
+  if (quick_capture_active) {
+    // 显示抓包进度
+    displayQuickCaptureProgress();
+    
+    // 若请求了握手抓包，则启动抓包（初始化）
+    if (readyToSniff && !sniffer_active) {
+      Serial.println("[QuickCapture] Trigger capture from loop()");
+      deauthAndSniff(); // 初始化状态机
+    }
+    
+    // 持续更新非阻塞抓包状态机
+    if (sniffer_active) {
+      deauthAndSniff_update();
+    }
+    
+    // 检查抓包是否完成 - 在deauthAndSniff_update()完成后检查
+    if (!sniffer_active && readyToSniff == false && quick_capture_active) {
+      // deauthAndSniff_update()已完成，检查结果
+      static unsigned long lastCheckTime = 0;
+      if (millis() - lastCheckTime > 1000) { // 每秒检查一次
+        lastCheckTime = millis();
+        Serial.print("[QuickCapture] Status check - isHandshakeCaptured: ");
+        Serial.print(isHandshakeCaptured);
+        Serial.print(", handshakeDataAvailable: ");
+        Serial.print(handshakeDataAvailable);
+        Serial.print(", HS frames: ");
+        Serial.print(capturedHandshake.frameCount);
+        Serial.print("/4, MGMT frames: ");
+        Serial.print(capturedManagement.frameCount);
+        Serial.println("/10");
+        
+        // 实时检查：如果已经捕获到足够的帧，立即验证并设置标志
+        if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
+          // 临时启用详细日志来调试握手包验证失败的原因
+          bool oldVerboseLog = g_verboseHandshakeLog;
+          g_verboseHandshakeLog = true;
+          
+          if (isHandshakeCompleteQuickCapture()) {
+            Serial.println("[QuickCapture] Complete handshake detected in main loop, setting flags");
+            // 生成握手包数据
+            std::vector<uint8_t> pcapData = generatePcapBuffer();
+            Serial.print("PCAP size: "); Serial.print(pcapData.size()); Serial.println(" bytes");
+            globalPcapData = pcapData;
+            // 设置握手包捕获标志
+            isHandshakeCaptured = true;
+            handshakeDataAvailable = true;
+            // 记录统计与时间
+            lastCaptureTimestamp = millis();
+            lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
+            lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
+            handshakeJustCaptured = true;
+          } else {
+            Serial.println("[QuickCapture] Invalid handshake detected, clearing stats and restarting capture");
+            // 清空统计重新开始抓包
+            resetCaptureData();
+            resetGlobalHandshakeData();
+            // 重新启动抓包状态机
+            readyToSniff = true;
+            hs_sniffer_running = true;
+            sniffer_active = false; // 让状态机重新初始化
+            Serial.println("[QuickCapture] Capture restarted with cleared stats");
+          }
+          
+          // 恢复原始日志设置
+          g_verboseHandshakeLog = oldVerboseLog;
+        }
+      }
+      
+      if (isHandshakeCaptured && handshakeDataAvailable) {
+        Serial.println("[QuickCapture] Handshake captured successfully!");
+        quick_capture_completed = true;
+        quick_capture_end_time = millis();
+        
+        // 直接启动Web服务并返回主菜单
+        startWebServiceForCapture();
+        
+        // 清理状态
+        quick_capture_active = false;
+        readyToSniff = false;
+        hs_sniffer_running = false;
+        sniffer_active = false;
+        
+        // 显示Web服务信息后返回主菜单
+        drawWebServiceInfo();
+        return;
+      } else {
+        // 抓包未完成，检查是否超时
+        if (millis() - quick_capture_start_time > 60000) {
+          Serial.println("[QuickCapture] Capture timeout");
+          quick_capture_active = false;
+          drawQuickCaptureTimeout();
+        }
+      }
+    }
+    
+    // 检查返回键停止抓包
+    if (digitalRead(BTN_BACK) == LOW) {
+      delay(200);
+      // 稳定按键状态，为确认弹窗做准备
+      stabilizeButtonState();
+      if (showConfirmModal("停止抓包")) {
+        Serial.println("[QuickCapture] User stopped capture");
+        quick_capture_active = false;
+        readyToSniff = false;
+        hs_sniffer_running = false;
+        sniffer_active = false;
+        return;
+      }
+    }
+    
+    return;
+  }
+  
+  // 快速抓包完成后的Web服务模式
+  if (quick_capture_completed && web_server_active) {
+    // 处理Web客户端 - 优化连接处理
+    unsigned long currentTime = millis();
+    if (currentTime - last_web_check >= 100) { // 减少检查间隔提高响应速度
+      last_web_check = currentTime;
+      
+      WiFiClient client = web_server.available();
+      if (client) {
+        // 设置客户端超时
+        client.setTimeout(5000);
+        Serial.println("[QuickCapture] Web client connected");
+        handleWebClient(client);
+        client.stop(); // 立即关闭连接，避免连接堆积
+      }
+    }
+    
+    // DNS服务器自动处理请求，无需手动调用
+    
+    // 显示Web服务状态
+    static unsigned long last_status_update = 0;
+    if (currentTime - last_status_update >= 2000) {
+      last_status_update = currentTime;
+      displayWebServiceStatus();
+    }
     return;
   }
   // 连接干扰运行时无独立状态机，进入功能内自循环直到用户停止
@@ -7239,7 +7395,7 @@ void displayWebUIStatus() {
 // 处理Web客户端请求
 void handleWebClient(WiFiClient& client) {
   String request = "";
-  unsigned long timeout = millis() + 3000; // 3秒超时
+  unsigned long timeout = millis() + 2000; // 减少到2秒超时
   
   // 读取HTTP请求头
   while (client.connected() && millis() < timeout) {
@@ -7251,6 +7407,12 @@ void handleWebClient(WiFiClient& client) {
       }
     }
     delay(1);
+  }
+  
+  // 如果请求为空或超时，直接返回
+  if (request.length() == 0) {
+    Serial.println("[WebClient] Empty request or timeout");
+    return;
   }
   
   // 解析请求方法和路径
@@ -7274,9 +7436,9 @@ void handleWebClient(WiFiClient& client) {
         int contentLength = contentLengthStr.toInt();
         
         // 读取请求体
-        if (contentLength > 0) {
+        if (contentLength > 0 && contentLength < 1024) { // 限制请求体大小
           String body = "";
-          unsigned long bodyTimeout = millis() + 2000; // 2秒超时读取请求体
+          unsigned long bodyTimeout = millis() + 1000; // 减少到1秒超时
           while (client.available() < contentLength && millis() < bodyTimeout) {
             delay(1);
           }
@@ -7305,7 +7467,12 @@ void handleWebClient(WiFiClient& client) {
   }
   // 处理不同的请求路径（精简为自定义信标功能）
   else if (path == "/" || path == "/index.html") {
-    sendWebPage(client);
+    // 如果是快速抓包模式，显示抓包下载页面，否则显示Web UI页面
+    if (quick_capture_completed) {
+      sendQuickCapturePage(client);
+    } else {
+      sendWebPage(client);
+    }
   } else if (method == "POST" && path == "/custom-beacon") {
     // 解析POST体中的ssid与band（支持x-www-form-urlencoded或JSON的简单匹配）
     String body = "";
@@ -7381,6 +7548,15 @@ void handleWebClient(WiFiClient& client) {
     }
   } else if (path == "/status") {
     handleStatusRequest(client);
+  } else if (path == "/capture") {
+    // 快速抓包完成后的下载页面
+    sendQuickCapturePage(client);
+  } else if (path == "/capture/download") {
+    // 下载PCAP文件
+    sendPcapDownload(client);
+  } else if (path == "/capture/status") {
+    // 抓包状态API
+    sendCaptureStatus(client);
   } else if (method == "POST" && path == "/stop") {
     // minimal stop for custom beacon
     beaconAttackRunning = false;
@@ -8103,4 +8279,527 @@ void homeActionWebUI() {
   if (showConfirmModal("启动Web UI")) {
     startWebUI();
   }
+}
+
+void homeActionQuickCapture() {
+  if (SelectedVector.empty()) {
+    showModalMessage("请先选择AP/SSID");
+    return;
+  }
+  
+  // 显示抓包模式选择界面
+  drawQuickCaptureModeSelection();
+}
+
+// 快速抓包模式选择界面
+void drawQuickCaptureModeSelection() {
+  int modeState = 0; // 0=主动, 1=被动, 2=高效
+  const char* modeNames[] = {"主动模式", "被动模式", "高效模式"};
+  
+  while (true) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    // 标题 - 居中显示
+    const char* title = "快速抓包模式选择";
+    int titleWidth = u8g2_for_adafruit_gfx.getUTF8Width(title);
+    int titleCenterX = (display.width() - titleWidth) / 2;
+    if (titleCenterX < 0) titleCenterX = 0;
+    u8g2_for_adafruit_gfx.setCursor(titleCenterX, 15);
+    u8g2_for_adafruit_gfx.print(title);
+    
+    // 显示模式选项
+    for (int i = 0; i < 3; i++) {
+      int y = 25 + i * 14; // 增加行间距
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      
+      // 计算文字居中位置 - 使用准确的UTF8宽度
+      int textWidth = u8g2_for_adafruit_gfx.getUTF8Width(modeNames[i]);
+      int centerX = (display.width() - textWidth) / 2;
+      if (centerX < 0) centerX = 0;
+      
+      // 如果是当前选中的选项，在左右两侧显示箭头
+      if (i == modeState) {
+        // 左侧箭头
+        u8g2_for_adafruit_gfx.setCursor(centerX - 15, y + 8);
+        u8g2_for_adafruit_gfx.print("-");
+        
+        // 右侧箭头
+        u8g2_for_adafruit_gfx.setCursor(centerX + textWidth + 5, y + 8);
+        u8g2_for_adafruit_gfx.print(" -");
+      }
+      
+      // 显示选项文字
+      u8g2_for_adafruit_gfx.setCursor(centerX, y + 8);
+      u8g2_for_adafruit_gfx.print(modeNames[i]);
+    }
+    
+    
+    display.display();
+    
+    // 按键处理 - 使用防抖机制
+    static unsigned long lastKeyTime = 0;
+    static bool keyPressed = false;
+    
+    if (digitalRead(BTN_UP) == LOW) {
+      if (!keyPressed && millis() - lastKeyTime > 150) {
+        keyPressed = true;
+        lastKeyTime = millis();
+        if (modeState > 0) modeState--;
+      }
+    } else if (digitalRead(BTN_DOWN) == LOW) {
+      if (!keyPressed && millis() - lastKeyTime > 150) {
+        keyPressed = true;
+        lastKeyTime = millis();
+        if (modeState < 2) modeState++;
+      }
+    } else if (digitalRead(BTN_OK) == LOW) {
+      if (!keyPressed && millis() - lastKeyTime > 150) {
+        keyPressed = true;
+        lastKeyTime = millis();
+        quick_capture_mode = modeState;
+        startQuickCapture();
+        return;
+      }
+    } else if (digitalRead(BTN_BACK) == LOW) {
+      if (!keyPressed && millis() - lastKeyTime > 150) {
+        keyPressed = true;
+        lastKeyTime = millis();
+        return;
+      }
+    } else {
+      keyPressed = false;
+    }
+    
+    delay(20); // 减少主循环延迟
+  }
+}
+
+// 启动快速抓包
+void startQuickCapture() {
+  if (SelectedVector.empty()) {
+    showModalMessage("请先选择AP/SSID");
+    return;
+  }
+  
+  // 设置目标网络
+  int selectedIndex = SelectedVector[0];
+  WiFiScanResult selected = scan_results[selectedIndex];
+  memcpy(_selectedNetwork.bssid, selected.bssid, 6);
+  _selectedNetwork.ssid = selected.ssid;
+  _selectedNetwork.ch = selected.channel;
+  AP_Channel = String(selected.channel);
+  
+  // 配置抓包模式
+  if (quick_capture_mode == 1) { // 被动模式
+    g_captureMode = CAPTURE_MODE_PASSIVE;
+    g_captureDeauthEnabled = false;
+    Serial.println("[QuickCapture] Mode: PASSIVE");
+  } else if (quick_capture_mode == 2) { // 高效模式
+    g_captureMode = CAPTURE_MODE_EFFICIENT;
+    g_captureDeauthEnabled = false;
+    Serial.println("[QuickCapture] Mode: EFFICIENT");
+  } else { // 主动模式
+    g_captureMode = CAPTURE_MODE_ACTIVE;
+    g_captureDeauthEnabled = true;
+    Serial.println("[QuickCapture] Mode: ACTIVE");
+  }
+  
+  Serial.print("[QuickCapture] Target: ");
+  Serial.print(_selectedNetwork.ssid);
+  Serial.print(" (");
+  Serial.print(macToString(_selectedNetwork.bssid, 6));
+  Serial.print(") CH");
+  Serial.println(_selectedNetwork.ch);
+  
+  // 重置抓包状态
+  isHandshakeCaptured = false;
+  handshakeDataAvailable = false;
+  resetCaptureData();
+  resetGlobalHandshakeData();
+  
+  // 启动抓包
+  quick_capture_active = true;
+  quick_capture_completed = false;
+  quick_capture_start_time = millis();
+  readyToSniff = true;
+  hs_sniffer_running = true;
+  
+  // 显示启动信息
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  u8g2_for_adafruit_gfx.setCursor(5, 30);
+  u8g2_for_adafruit_gfx.print("正在启动抓包...");
+  display.display();
+  delay(1000);
+}
+
+// 显示快速抓包进度（非阻塞）
+void displayQuickCaptureProgress() {
+  static unsigned long lastUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  // 每500ms更新一次显示
+  if (currentTime - lastUpdate > 500) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    // 标题
+    u8g2_for_adafruit_gfx.setCursor(5, 15);
+    u8g2_for_adafruit_gfx.print("快速抓包进行中...");
+    
+    // 显示目标网络信息
+    u8g2_for_adafruit_gfx.setCursor(5, 25);
+    u8g2_for_adafruit_gfx.print("目标: ");
+    String ssidDisplay = _selectedNetwork.ssid.length() > 8 ? _selectedNetwork.ssid.substring(0, 8) + "..." : _selectedNetwork.ssid;
+    u8g2_for_adafruit_gfx.print(ssidDisplay);
+    
+    // 显示抓包统计
+    u8g2_for_adafruit_gfx.setCursor(5, 35);
+    u8g2_for_adafruit_gfx.print("握手帧: ");
+    u8g2_for_adafruit_gfx.print(capturedHandshake.frameCount);
+    u8g2_for_adafruit_gfx.print("/4");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 45);
+    u8g2_for_adafruit_gfx.print("管理帧: ");
+    u8g2_for_adafruit_gfx.print(capturedManagement.frameCount);
+    u8g2_for_adafruit_gfx.print("/10");
+    
+    // 显示运行时间
+    u8g2_for_adafruit_gfx.setCursor(5, 55);
+    u8g2_for_adafruit_gfx.print("时间: ");
+    u8g2_for_adafruit_gfx.print((currentTime - quick_capture_start_time) / 1000);
+    u8g2_for_adafruit_gfx.print("s");
+    
+    display.display();
+    lastUpdate = currentTime;
+  }
+}
+
+// 抓包完成界面
+void drawQuickCaptureComplete() {
+  int menuState = 0; // 0=启动Web服务, 1=返回主菜单
+  
+  while (true) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    // 标题
+    u8g2_for_adafruit_gfx.setCursor(5, 15);
+    u8g2_for_adafruit_gfx.print("抓包完成!");
+    
+    // 显示统计信息
+    u8g2_for_adafruit_gfx.setCursor(5, 25);
+    u8g2_for_adafruit_gfx.print("握手帧: ");
+    u8g2_for_adafruit_gfx.print(capturedHandshake.frameCount);
+    u8g2_for_adafruit_gfx.print("/4");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 35);
+    u8g2_for_adafruit_gfx.print("管理帧: ");
+    u8g2_for_adafruit_gfx.print(capturedManagement.frameCount);
+    u8g2_for_adafruit_gfx.print("/10");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 45);
+    u8g2_for_adafruit_gfx.print("用时: ");
+    u8g2_for_adafruit_gfx.print((quick_capture_end_time - quick_capture_start_time) / 1000);
+    u8g2_for_adafruit_gfx.print("s");
+    
+    // 显示菜单选项
+    const char* menuItems[] = {"启动Web服务", "返回主菜单"};
+    for (int i = 0; i < 2; i++) {
+      int y = 55 + i * 12;
+      if (i == menuState) {
+        display.fillRoundRect(0, y-2, 128, 12, 2, SSD1306_WHITE);
+        u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
+      } else {
+        u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      }
+      u8g2_for_adafruit_gfx.setCursor(5, y + 8);
+      u8g2_for_adafruit_gfx.print(menuItems[i]);
+    }
+    
+    display.display();
+    
+    // 按键处理
+    if (digitalRead(BTN_UP) == LOW) {
+      delay(200);
+      if (menuState > 0) menuState--;
+    }
+    if (digitalRead(BTN_DOWN) == LOW) {
+      delay(200);
+      if (menuState < 1) menuState++;
+    }
+    if (digitalRead(BTN_OK) == LOW) {
+      delay(200);
+      if (menuState == 0) {
+        // 启动Web服务
+        startWebServiceForCapture();
+        // 显示Web服务信息
+        drawWebServiceInfo();
+        return;
+      } else {
+        // 返回主菜单
+        return;
+      }
+    }
+    if (digitalRead(BTN_BACK) == LOW) {
+      delay(200);
+      return;
+    }
+    delay(50);
+  }
+}
+
+// 抓包超时界面
+void drawQuickCaptureTimeout() {
+  while (true) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 20);
+    u8g2_for_adafruit_gfx.print("抓包超时");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 35);
+    u8g2_for_adafruit_gfx.print("未捕获到完整握手包");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 50);
+    u8g2_for_adafruit_gfx.print("《 返回主菜单");
+    
+    display.display();
+    
+    if (digitalRead(BTN_BACK) == LOW) {
+      delay(200);
+      return;
+    }
+    delay(50);
+  }
+}
+
+// 启动Web服务用于抓包下载
+void startWebServiceForCapture() {
+  Serial.println("=== 启动快速抓包Web服务 ===");
+  
+  // 清理之前的服务
+  stopWebServer();
+  stopDNSServer();
+  disconnectWiFi();
+  cleanupClients();
+  
+  // 等待网络完全断开
+  delay(2000);
+  
+  // 启动AP模式
+  Serial.println("启动抓包Web服务AP模式...");
+  char channel_str[4];
+  sprintf(channel_str, "%d", WEB_UI_CHANNEL);
+  
+  // 重试机制
+  int retryCount = 0;
+  bool apStarted = false;
+  while (retryCount < 3 && !apStarted) {
+    if (WiFi.apbegin(WEB_UI_SSID, WEB_UI_PASSWORD, channel_str, 0)) {
+      apStarted = true;
+      Serial.println("抓包Web服务AP模式启动成功");
+    } else {
+      retryCount++;
+      Serial.print("抓包Web服务AP模式启动失败，重试 ");
+      Serial.print(retryCount);
+      Serial.println("/3");
+      delay(1000);
+    }
+  }
+  
+  if (apStarted) {
+    Serial.println("SSID: " + String(WEB_UI_SSID));
+    Serial.println("密码: " + String(WEB_UI_PASSWORD));
+    Serial.println("信道: " + String(WEB_UI_CHANNEL));
+    
+    // 等待AP完全启动
+    delay(2000);
+    
+    IPAddress apIp = WiFi.localIP();
+    Serial.print("IP地址: ");
+    Serial.println(apIp);
+    
+    // 启动Web服务
+    startWebUIServices(apIp);
+    
+    Serial.println("抓包Web服务启动完成");
+  } else {
+    Serial.println("抓包Web服务AP模式启动失败，已重试3次");
+  }
+}
+
+// 发送快速抓包完成页面
+void sendQuickCapturePage(WiFiClient& client) {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>快速抓包完成</title>";
+  html += "<style>";
+  html += "body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#f5f5f5;}";
+  html += ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
+  html += "h1{color:#333;text-align:center;margin-bottom:30px;}";
+  html += ".status{background:#e8f5e8;border:1px solid #4caf50;padding:15px;border-radius:5px;margin:20px 0;}";
+  html += ".info{background:#f0f8ff;border:1px solid #2196f3;padding:15px;border-radius:5px;margin:20px 0;}";
+  html += ".btn{display:inline-block;padding:12px 24px;background:#4caf50;color:white;text-decoration:none;border-radius:5px;margin:10px 5px;text-align:center;}";
+  html += ".btn:hover{background:#45a049;}";
+  html += ".btn-danger{background:#f44336;}";
+  html += ".btn-danger:hover{background:#da190b;}";
+  html += ".stats{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin:20px 0;}";
+  html += ".stat-item{background:#f9f9f9;padding:15px;border-radius:5px;text-align:center;}";
+  html += ".stat-value{font-size:24px;font-weight:bold;color:#2196f3;}";
+  html += ".stat-label{color:#666;margin-top:5px;}";
+  html += "</style></head><body>";
+  html += "<div class='container'>";
+  html += "<h1>🔐 快速抓包完成</h1>";
+  
+  // 显示抓包统计信息
+  html += "<div class='status'>";
+  html += "<h3>抓包统计</h3>";
+  html += "<div class='stats'>";
+  html += "<div class='stat-item'><div class='stat-value'>" + String(capturedHandshake.frameCount) + "/4</div><div class='stat-label'>握手帧</div></div>";
+  html += "<div class='stat-item'><div class='stat-value'>" + String(capturedManagement.frameCount) + "/10</div><div class='stat-label'>管理帧</div></div>";
+  html += "<div class='stat-item'><div class='stat-value'>" + String((quick_capture_end_time - quick_capture_start_time) / 1000) + "s</div><div class='stat-label'>抓取时间</div></div>";
+  html += "<div class='stat-item'><div class='stat-value'>" + String(globalPcapData.size()) + "B</div><div class='stat-label'>文件大小</div></div>";
+  html += "</div></div>";
+  
+  // 显示目标网络信息
+  html += "<div class='info'>";
+  html += "<h3>目标网络信息</h3>";
+  html += "<p><strong>SSID:</strong> " + _selectedNetwork.ssid + "</p>";
+  html += "<p><strong>BSSID:</strong> " + macToString(_selectedNetwork.bssid, 6) + "</p>";
+  html += "<p><strong>频道:</strong> " + String(_selectedNetwork.ch) + "</p>";
+  html += "<p><strong>抓包模式:</strong> ";
+  if (quick_capture_mode == 0) html += "主动模式";
+  else if (quick_capture_mode == 1) html += "被动模式";
+  else html += "高效模式";
+  html += "</p></div>";
+  
+  // 操作按钮
+  html += "<div style='text-align:center;margin:30px 0;'>";
+  html += "<a href='/capture/download' class='btn'>📥 下载PCAP文件</a>";
+  html += "<a href='/' class='btn btn-danger'>🏠 返回主页</a>";
+  html += "</div>";
+  
+  html += "<div style='text-align:center;color:#666;font-size:14px;'>";
+  html += "<p>⚠️ 此功能仅用于安全研究和教育目的，请勿用于非法用途</p>";
+  html += "</div></div></body></html>";
+  
+  String header = "HTTP/1.1 200 OK\r\n";
+  header += "Content-Type: text/html; charset=UTF-8\r\n";
+  header += "Content-Length: " + String(html.length()) + "\r\n";
+  header += "Connection: close\r\n\r\n";
+  client.print(header);
+  client.print(html);
+}
+
+// 发送PCAP文件下载
+void sendPcapDownload(WiFiClient& client) {
+  if (globalPcapData.empty()) {
+    String hdr = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+    client.print(hdr);
+    return;
+  }
+  
+  String hdr = "HTTP/1.1 200 OK\r\n";
+  hdr += "Content-Type: application/octet-stream\r\n";
+  hdr += "Content-Disposition: attachment; filename=\"handshake_" + _selectedNetwork.ssid + ".pcap\"\r\n";
+  hdr += "Content-Length: " + String(globalPcapData.size()) + "\r\n";
+  hdr += "Connection: close\r\n\r\n";
+  client.print(hdr);
+  client.write(globalPcapData.data(), globalPcapData.size());
+}
+
+// 发送抓包状态API
+void sendCaptureStatus(WiFiClient& client) {
+  String json = "{";
+  json += "\"completed\":" + String(quick_capture_completed ? "true" : "false") + ",";
+  json += "\"handshake_frames\":" + String(capturedHandshake.frameCount) + ",";
+  json += "\"management_frames\":" + String(capturedManagement.frameCount) + ",";
+  json += "\"capture_time\":" + String((quick_capture_end_time - quick_capture_start_time) / 1000) + ",";
+  json += "\"file_size\":" + String(globalPcapData.size()) + ",";
+  json += "\"target_ssid\":\"" + _selectedNetwork.ssid + "\",";
+  json += "\"target_bssid\":\"" + macToString(_selectedNetwork.bssid, 6) + "\",";
+  json += "\"target_channel\":" + String(_selectedNetwork.ch) + ",";
+  json += "\"capture_mode\":" + String(quick_capture_mode);
+  json += "}";
+  
+  String hdr = "HTTP/1.1 200 OK\r\n";
+  hdr += "Content-Type: application/json\r\n";
+  hdr += "Content-Length: " + String(json.length()) + "\r\n";
+  hdr += "Connection: close\r\n\r\n";
+  client.print(hdr);
+  client.print(json);
+}
+
+// 显示Web服务信息
+void drawWebServiceInfo() {
+  while (true) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    // 标题
+    u8g2_for_adafruit_gfx.setCursor(5, 18);
+    u8g2_for_adafruit_gfx.print("已抓取到握手包");
+    
+    // 显示连接信息
+    u8g2_for_adafruit_gfx.setCursor(5, 30);
+    u8g2_for_adafruit_gfx.print("继续将启动Web服务");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 42);
+    u8g2_for_adafruit_gfx.print("以下载握手包");
+    
+    u8g2_for_adafruit_gfx.setCursor(5, 54);
+    u8g2_for_adafruit_gfx.print("《 继续 | 下载");
+    
+    display.display();
+    
+    // 按键处理
+    if (digitalRead(BTN_BACK) == LOW) {
+      delay(200);
+      return;
+    }
+    delay(50);
+  }
+}
+
+// 显示Web服务状态
+void displayWebServiceStatus() {
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  
+  // 标题
+  u8g2_for_adafruit_gfx.setCursor(5, 15);
+  u8g2_for_adafruit_gfx.print("Web服务已启动");
+  
+  // 显示目标网络信息
+  u8g2_for_adafruit_gfx.setCursor(5, 25);
+  u8g2_for_adafruit_gfx.print("目标: ");
+  String ssidDisplay = _selectedNetwork.ssid.length() > 8 ? _selectedNetwork.ssid.substring(0, 8) + "..." : _selectedNetwork.ssid;
+  u8g2_for_adafruit_gfx.print(ssidDisplay);
+  
+  // 显示抓包统计
+  u8g2_for_adafruit_gfx.setCursor(5, 35);
+  u8g2_for_adafruit_gfx.print("握手帧: ");
+  u8g2_for_adafruit_gfx.print(capturedHandshake.frameCount);
+  u8g2_for_adafruit_gfx.print("/4");
+  
+  u8g2_for_adafruit_gfx.setCursor(5, 45);
+  u8g2_for_adafruit_gfx.print("管理帧: ");
+  u8g2_for_adafruit_gfx.print(capturedManagement.frameCount);
+  u8g2_for_adafruit_gfx.print("/10");
+  
+  // 显示Web地址
+  u8g2_for_adafruit_gfx.setCursor(5, 55);
+  u8g2_for_adafruit_gfx.print("Web: 192.168.1.1");
+  
+  display.display();
 }
