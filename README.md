@@ -1,17 +1,34 @@
 # 🛠️ [BW16-Tools](https://github.com/FlyingIceyyds/BW16-Tools)
 基于Ai-Thinker BW16-Kit RTL8720DN 的无线安全测试工具。包含WIFI功能：解除身份认证(Deauth)，信道干扰(Channel Interference)，Deauth/Disassoc帧检测(Detect)，密码钓鱼(Phishing)，认证/关联帧洪水攻击(Dos)，以及BLE功能：蓝牙弹窗攻击，蓝牙信标广播等。仅用于安全性研究和教育目的，请勿滥用。使用Arduino开发。
 
-# 2025-10-05
-创建了一个新的Beta分支，此分支添加了蓝牙BLE相关功能，但有一些BUG未能解决：
-- 1.由于BW16模块设计问题，WIFI和BLE抢占资源导致部分情况下功能异常。
-- 2.疑似BLE功能会导致严重的内存溢出。（影响抓包功能使用，握手包缓存异常）
+# 2025-10-12
+此项目已停止或暂缓更新。由于BW16资源极其有限，这限制了更多功能的开发，例如共享SRAM的设计会导致部分功能引起的内存溢出（如BLE相关功能），我认为不值得为此设备浪费更多时间。另外此项目最初只是自用没打算开源所以代码结构混乱不易维护，同时也会影响参考价值。
 
-此项目中内存溢出与资源冲突似乎达成了一种微妙的平衡，以至于大部分功能一切正常，但存在潜在问题，这也是这些BUG难以修复的原因之一。
+当然此项目依旧欢迎新的贡献者（如果你愿意为此花费更多时间）
 
-***简单来说，如果你只需要用到WIFI相关功能，那么建议使用 [`main`](https://github.com/FlyingIceyyds/BW16-Tools/tree/main) 分支的旧版本。
-如果愿意舍弃WIFI的抓包功能以使用蓝牙BLE相关功能，那么请使用[`Beta`](https://github.com/FlyingIceyyds/BW16-Tools/tree/Beta)分支版本***
+当前项目包含两个分支：
 
-***如果你成功修复了这些问题，那么随时欢迎为此项目做出贡献***
+- [main分支](https://github.com/FlyingIceyyds/BW16-Tools/tree/main)
+    - 仅包含WIFI相关功能
+    - 功能稳定，无资源紧缺造成的严重故障（如内存溢出等）
+
+- [Beta分支](https://github.com/FlyingIceyyds/BW16-Tools/tree/Beta)
+    - 包含蓝牙BLE相关功能（蓝牙弹窗和蓝牙信标广播）
+    - 由于BW16内存资源有限，Beta版BLE功能会造成严重的内存溢出，导致部分设备出现SSID列表显示异常，无法启动，功能异常等，需自行测试
+
+**如果你只需要使用WIFI相关功能，那么请前往[releases](https://github.com/FlyingIceyyds/BW16-Tools/releases)下载最新版本Bin文件进行烧录，或克隆仓库自行编译：**
+
+``` bash
+git clone https://github.com/FlyingIceyyds/BW16-Tools/
+```
+
+**如果你要使用BLE蓝牙相关功能，那么请下载此版本Bin进行烧录：[Beta 1.0](https://github.com/FlyingIceyyds/BW16-Tools/releases/tag/Beta1.0)，或克隆仓库自行编译：**
+
+``` bash
+git clone -b Beta https://github.com/FlyingIceyyds/BW16-Tools/
+```
+
+**注意：Beta版中，一些WIFI相关功能可能无法使用或工作不正常，具体因设备而异。如果不需要使用BLE蓝牙相关功能，请不要使用Beta版本！这是由于BW16共享SRAM设计导致内存不足从而引起的内存溢出，软件层面很难跟进修复。**
 
 # 📌 使用须知
 本项目旨在合规前提下用于安全性研究和教育目的，请勿滥用。
@@ -33,6 +50,9 @@
     - 将目标AP发送的信标帧和探测响应克隆到多个信道
     - 客户端无法确认真正的AP工作在哪个信道，从而干扰连接
     - 通信层面干扰，无视WPA/WPA2/WPA3等安全协议
+- 广播黑洞[BBH]
+    - 主要功能：尝试吞噬目标AP生成的信标帧从而使目标WIFI无法被扫描到
+    - 被动技能：实测此功能运行时如果附近有Windows设备正在扫描WIFI，那么有概率导致此设备无线网卡故障，表现为扫描不到WIFI或WIFI开关无法开启，重启设备或重启网卡即可解决
 - AP洪水攻击 [Dos]
     - 向目标AP发送大量随机Mac地址的开放认证请求和关联请求帧
     - 实测针对轻量家用路由和随身WIFI效果显著，对于手机热点无效
@@ -45,6 +65,8 @@
     - 监听指定信道中的有效数据包数量
     - 生成实时图表统计
     - 右上角出现“[*]”指示，表示监听到了解除认证/关联帧
+- 快速抓捕 [Capture]
+    抓取WAP/WPA2握手包，与 Web UI 的 Handshake Capture 功能相同，但操作相对更方便
 - Web UI
     - 自定义SSID信标帧攻击 [Custom Beacon]
     - WPA/WPA2握手包抓取 [Handshake Capture]
