@@ -54,20 +54,29 @@ void wifi_tx_deauth_frame(void* src_mac, void* dst_mac, uint16_t reason) {
  * @param ssid 以'\0'结尾的字符数组，表示SSID
 */
 void wifi_tx_beacon_frame(void* src_mac, void* dst_mac, const char *ssid) {
+  if (!src_mac || !dst_mac || !ssid) {
+    Serial.println("ERROR: Invalid parameters for beacon frame");
+    return;
+  }
+  
   BeaconFrame frame;
-  // 设置源MAC地址
   memcpy(&frame.source, src_mac, 6);
-  // 设置接入点MAC地址
   memcpy(&frame.access_point, src_mac, 6);
-  // 设置目标MAC地址
   memcpy(&frame.destination, dst_mac, 6);
-  // 复制SSID并计算长度
-  for (int i = 0; ssid[i] != '\0'; i++) {
+  frame.ssid_length = 0;
+  
+  for (int i = 0; ssid[i] != '\0' && i < 255; i++) {
     frame.ssid[i] = ssid[i];
     frame.ssid_length++;
   }
-  // 发送帧（帧大小为基础大小38字节加上SSID长度）
-  wifi_tx_raw_frame(&frame, 38 + frame.ssid_length);
+  
+  size_t frameSize = 38 + frame.ssid_length;
+  if (frameSize > 512) {
+    Serial.println("ERROR: Beacon frame too large");
+    return;
+  }
+  
+  wifi_tx_raw_frame(&frame, frameSize);
 }
 
 size_t wifi_build_beacon_frame(void* src_mac, void* dst_mac, const char *ssid, BeaconFrame &out) {

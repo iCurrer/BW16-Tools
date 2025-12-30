@@ -231,7 +231,6 @@ const char WEB_ADMIN_HTML[] PROGMEM = R"rawliteral(
       <h2>🔐 WPA/WPA2 握手抓包</h2>
       <div class="card">
         <p style="text-align:center;">此功能可以捕获WPA/WPA2 4-way握手包</p>
-        <p style="color:red;text-align:center;">V2.2版本后建议使用OLED菜单的快速抓包功能！</p>
         <div class="row" style="gap:8px; align-items:center; justify-content:center; margin-top:8px;">
           <select id="ap-select" style="min-width:80%; padding:8px;">
             <option value="">正在加载列表...</option>

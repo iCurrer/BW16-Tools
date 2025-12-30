@@ -72,6 +72,10 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
         while (offset < udp_packet_buffer->len && ((uint8_t*)udp_packet_buffer->payload)[offset] != 0) {
             nameLength++;
             offset++;
+            if (nameLength > 255) {
+                pbuf_free(udp_packet_buffer);
+                return;
+            }
         }
         
         if (offset >= udp_packet_buffer->len - 4) {
@@ -113,8 +117,14 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
             *(uint16_t *)(responsePtr + 14) = PP_HTONS(4);
             memcpy(responsePtr + 16, dnsServerInstance->_resolvedIP, 4);
 
-            udp_sendto(udp_pcb, p, sender_addr, sender_port);
+            err_t err = udp_sendto(udp_pcb, p, sender_addr, sender_port);
+            if (err != ERR_OK) {
+                Serial.print("DNS send error: ");
+                Serial.println(err);
+            }
             pbuf_free(p);
+        } else {
+            Serial.println("ERROR: Failed to allocate DNS response buffer");
         }
     } else {
         struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, udp_packet_buffer->len, PBUF_RAM);
@@ -125,8 +135,14 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
             dns_rsp->flags1 |= 0x80;
             dns_rsp->flags2 = 0x05;
             
-            udp_sendto(udp_pcb, p, sender_addr, sender_port);
+            err_t err = udp_sendto(udp_pcb, p, sender_addr, sender_port);
+            if (err != ERR_OK) {
+                Serial.print("DNS error response send error: ");
+                Serial.println(err);
+            }
             pbuf_free(p);
+        } else {
+            Serial.println("ERROR: Failed to allocate DNS error response buffer");
         }
     }
 

