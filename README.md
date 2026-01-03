@@ -1,22 +1,38 @@
-# 🛠️ [BW16-Tools](https://github.com/FlyingIceyyds/BW16-Tools)
-基于Ai-Thinker BW16-Kit RTL8720DN 的无线安全测试工具。包含WIFI功能：解除身份认证(Deauth)，信道干扰(Channel Interference)，Deauth/Disassoc帧检测(Detect)，密码钓鱼(Phishing)，认证/关联帧洪水攻击(Dos)，以及BLE功能：蓝牙弹窗攻击，蓝牙信标广播等。仅用于安全性研究和教育目的，请勿滥用。使用Arduino开发。
+# 🛠️ BW16-Tools (Fork — Beta 1.2)
 
-# 2025-10-22
-此项目已归档，不再计划更新。
+> **说明**：此为 `FlyingIceyyds/BW16-Tools` 的 Fork 维护版（Beta 1.2）。  
+> 原项目已归档（只读），本仓库在遵守原 **GPL-3.0** 许可证的前提下对代码进行维护、重构和优化。  
+> 本项目仅用于合规的安全研究与教学目的，请勿滥用。
 
-由于BW16硬件资源比较有限，我认为不适合继续添加新的功能。另外此项目最初只为自用，并且我没有Arduino相关的开发经验，这导致项目结构混乱不易维护。同时我收到的一些反馈，有一些因设备而异造成的问题，有些设备工作正常，而有些设备会遇到问题，我并没有更好的办法来排查此类问题。如果后续你对此项目有任何疑问可随时与我联系。另外我在规划一个新的功能更全面且结构规范易维护的项目（同类型但与BW16无关），但目前详情还只是未知。
+---
 
-补充：此项目基于[5gwifi-bw16](https://github.com/shiyi226/5gwifi-bw16)，大部分的功能实现依靠[RTL8720dn-WiFi-Packet-Injection](https://github.com/tesa-klebeband/RTL8720dn-WiFi-Packet-Injection)
+## 🔖 版本与维护信息
 
-当前项目包含两个分支：
+- **当前维护版本**：Beta 1.2  
+- **发布日期**：2025-01-03  
+- **维护者**：`Silas`
+- **仓库状态**：继续维护 / 接受 issue & PR（优先修复关键 bug 与兼容性问题）
 
-- [main分支](https://github.com/FlyingIceyyds/BW16-Tools/tree/main)
-    - 仅包含WIFI相关功能
-    - 功能稳定，无资源紧缺造成的严重故障（如内存溢出等）
 
-- [Beta分支](https://github.com/FlyingIceyyds/BW16-Tools/tree/Beta)
-    - 包含蓝牙BLE相关功能（蓝牙弹窗和蓝牙信标广播）
-    - 由于BW16内存资源有限，Beta版BLE功能会造成严重的内存溢出，导致部分设备出现SSID列表显示异常，无法启动，功能异常等，需自行测试
+> 强调：仅限合规的安全研究与教学用途，请勿用于非法入侵或干扰他人通信。
+
+---
+
+## 🆕 Beta 1.2 — 更新要点（2025-01-03）
+
+### 🎯 本次核心改进
+- **统一信标发送接口**
+  - 新增 `sendBeaconUnified()`，并使用 `BeaconConfig` 封装参数
+  - 重构相关发送函数
+- **统一跨频段攻击接口**
+  - 新增 `executeCrossBandBeaconAttackUnified()`，并使用 `CrossBandConfig` 封装参数
+  - 重构多处跨频段攻击函数，减少重复代码（约 100 行）
+  - 修复结构体初始化时缺少 `delayMs` 字段的问题
+  - 提高可维护性、可读性与向后兼容性
+
+### 🐛 修复
+- 修复 `CrossBandConfig` 初始化缺少 `delayMs` 字段的问题  
+- 修复跨频段攻击函数参数传递不一致的问题
 
 **如果你只需要使用WIFI相关功能，那么请前往[releases](https://github.com/FlyingIceyyds/BW16-Tools/releases)下载最新版本Bin文件进行烧录，或克隆仓库自行编译：**
 
